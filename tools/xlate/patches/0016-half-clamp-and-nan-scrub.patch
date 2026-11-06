@@ -1,0 +1,33 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1075,6 +1075,13 @@
+             SpvInstruction value0 = context.GetFP32(operation.GetSource(0));
+             SpvInstruction value1 = context.GetFP32(operation.GetSource(1));
+             SpvInstruction vector = context.CompositeConstruct(context.TypeVector(context.TypeFP32(), 2), value0, value1);
++            // TOTK (MUA3, after fe3h-recomp 0.1.5): values past the half range stop at +-65504, as on AMD and Tegra, instead
++            // of becoming infinity (NVIDIA), which put whole areas in shadow. NaN passes unchanged.
++            SpvInstruction vec2 = context.TypeVector(context.TypeFP32(), 2);
++            SpvInstruction hmax = context.Constant(context.TypeFP32(), 65504f);
++            SpvInstruction hmin = context.Constant(context.TypeFP32(), -65504f);
++            SpvInstruction clamped = context.GlslNClamp(vec2, vector, context.CompositeConstruct(vec2, hmin, hmin), context.CompositeConstruct(vec2, hmax, hmax));
++            vector = context.Select(vec2, context.IsNan(context.TypeVector(context.TypeBool(), 2), vector), vector, clamped);
+             SpvInstruction result = context.GlslPackHalf2x16(context.TypeU32(), vector);
+ 
+             return new OperationResult(AggregateType.U32, result);
+--- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
+@@ -495,6 +495,14 @@
+ 
+                         Operand src = Register(regIndexBase + component, RegisterType.Gpr);
+ 
++                        // TOTK (MUA3, after fe3h-recomp 0.1.5): NaN or infinity in a float colour output is written as 0.
++                        // NVIDIA flushes denormals and makes NaN where Tegra does not; the game's blurs spread each one.
++                        if ((TranslatorContext.Definitions.GetFragmentOutputColorType(rtIndex) & AggregateType.ElementTypeMask) == AggregateType.FP32)
++                        {
++                            Operand bad = this.Add(Instruction.LogicalOr, Local(), this.IsNan(src), this.FPCompareEqual(this.FPAbsolute(src), ConstF(float.PositiveInfinity)));
++                            src = this.ConditionalSelect(bad, ConstF(0f), src);
++                        }
++
+                         // Perform B <-> R swap if needed, for BGRA formats (not supported on OpenGL).
+                         if (!supportsBgra && (component == 0 || component == 2))
+                         {

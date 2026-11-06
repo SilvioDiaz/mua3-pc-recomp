@@ -966,6 +966,11 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_install();
 }
 
+int plat_mem_watch(uint64_t addr, uint64_t n, void (*fn)(uint64_t addr, uint64_t exe_off)) {
+    (void)addr, (void)n, (void)fn;
+    return 0;   // the write watch is a Windows debugging aid
+}
+
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     fault_install();

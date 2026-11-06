@@ -1,0 +1,24 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
+@@ -196,9 +196,18 @@ namespace Ryujinx.Graphics.Shader.Instructions
+ 
+         public static void Pixld(EmitterContext context)
+         {
+-            context.GetOp<InstPixld>();
+-
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction Pixld is not implemented.");
++            InstPixld op = context.GetOp<InstPixld>();
++
++            // MUA3: the NVN compiler puts PIXLD.MY_INDEX in the epilogue of most pixel shaders. Left unimplemented, the
++            // destination register kept whatever it held before. Our pixel shaders run once per pixel (no sample-rate
++            // shading), which is sample 0, so MY_INDEX is 0; gl_SampleID would force per-sample shading on every MSAA
++            // pass. The coverage and offset modes have no Vulkan equivalent here and also give 0.
++            if (op.PixMode != PixMode.MyIndex)
++            {
++                context.TranslatorContext.GpuAccessor.Log($"Shader instruction Pixld.{op.PixMode} returns 0.");
++            }
++
++            context.Copy(InstEmitHelper.GetDest(op.Dest), IntermediateRepresentation.OperandHelper.Const(0));
+         }
+ 
+         public static void Plongjmp(EmitterContext context)

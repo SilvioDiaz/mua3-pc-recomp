@@ -1,0 +1,19 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -1046,6 +1046,16 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             // because constant buffer are always encoded as the second operand,
+             // so the second operand will always be the one from the last instruction.
+ 
++            // MUA3: NVN keeps the storage buffer descriptors in the driver reserved buffer only, so a c[0] addend wins over
++            // one from another bank even as the first operand ("c[1][x] + c[0][y]" had been bound from c[1]).
++            bool src1Driver = src1.Type == OperandType.ConstantBuffer && src1.GetCbufSlot() == DriverReservedCb;
++            bool src2Driver = src2.Type == OperandType.ConstantBuffer && src2.GetCbufSlot() == DriverReservedCb;
++
++            if (src1Driver && !src2Driver)
++            {
++                return GetBaseAddressCbWithOffset(src1, src2, constOffset);
++            }
++
+             if (src1.Type != OperandType.ConstantBuffer ||
+                 (src1.Type == OperandType.ConstantBuffer && src2.Type == OperandType.ConstantBuffer) ||
+                 (src2.Type == OperandType.ConstantBuffer && src2.GetCbufSlot() == DriverReservedCb))

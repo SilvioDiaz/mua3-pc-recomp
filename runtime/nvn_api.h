@@ -45,6 +45,7 @@ const pool_t *nvn_pool_find(uint64_t addr, uint64_t len);  // GPU-visible pool h
 uint64_t nvn_new_serial(void);                             // next tex_t / prog_t serial, from 1
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
+int nvn_origin_lower_left(void);                           // 0 after DeviceSetWindowOriginMode(UPPER_LEFT), else 1
 void nvn_guest_written(uint64_t addr, uint64_t size);      // the host or the game wrote pool storage: back end re-reads
 // TOTK_TRACE=perf: MemoryPoolFlushMappedRange [0] and BufferFlushMappedRange [1] calls [0] and bytes [1] by the pool's
 // CPU class (0 CPU_CACHED, 1 CPU_UNCACHED, 2 other) since the previous call.

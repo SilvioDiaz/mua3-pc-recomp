@@ -90,7 +90,8 @@ typedef struct VkExec {
     // The program bound for each NVN stage (vertex 0, fragment 1, ..., compute 5): a bind sets the stages of its mask
     // and keeps the others, so a game may bind one program per stage (MUA3: every program has a single stage).
     const prog_t *stage_prog[6];
-    NVNbufferRange vbuf[16];             // OP_BIND_VBUF
+    uint32_t prog_unbound;               // stage bits a BindProgram(NULL, stages) unbound: no fallback to prog
+    NVNbufferRange vbuf[16];            // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
 
@@ -116,6 +117,7 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    int pass_stores;                     // a draw of the open pass writes a storage buffer or image (keep_pass)
 } VkExec;
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
@@ -158,6 +160,8 @@ typedef struct {
     uint64_t fb_draws, fb_barriers, fb_restarts, fb_layouts;   // feedback loops: draws sampling a written target of
                                                                // their pass, in-pass barriers, pass restarts, layout
                                                                // transitions
+    uint64_t ub_updates, game_barriers;                        // UpdateUniformBuffer and Barrier ops
+    uint64_t barriers_in_pass;                                 // Barrier ops that left the pass open (keep_pass)
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
@@ -168,8 +172,16 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 // images are copied out and written as PNGs to TOTK_DUMP_DIR (default "dump"), with passes.txt (targets, pipelines,
 // textures, samplers) and images.txt (per image value statistics). The hooks run only when vk_dump_armed is set.
 extern int vk_dump_armed;
+void vk_dump_key(void);                  // F7: dump the frame three presents from now (vk_dump.c)
 void vk_dump_init(void);                 // reads the environment; vk_exec_record's first call
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
+void vk_dump_pass_begin(VkExec *ex);     // vk_exec_pass_begin, before the pass begins (TOTK_DUMP_PASS)
+// After a draw is recorded (TOTK_DUMP_PASS): what describes the call; ibuf/ibytes the index buffer, ind/ind_bytes the
+// indirect arguments (0 when there are none).
+void vk_dump_draw_done(VkExec *ex, const char *what, uint64_t ibuf, uint64_t ibytes, uint64_t ind, uint64_t ind_bytes);
+enum { VK_DROP_DISABLED, VK_DROP_SCISSOR, VK_DROP_NOPROG, VK_DROP_NOVS, VK_DROP_SHADER_PENDING, VK_DROP_SHADER_FAILED,
+       VK_DROP_DLAA, VK_DROP_PIPE_PENDING, VK_DROP_PIPE_FAILED, VK_DROP_N };
+void vk_dump_dropped(int why);           // prepare_draw dropped a draw (counted per pass in a dump)
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info);   // after a draw's binds
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d);
 void vk_dump_copy(VkExec *ex, uint32_t op, const void *payload);   // before a copy or texture clear is replayed

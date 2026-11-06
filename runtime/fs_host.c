@@ -1825,3 +1825,11 @@ int probe_fs(void) {
     printf("probe-fs: passed (%llu files, %d sampled)\n", (unsigned long long)files, SAMPLES);
     return 0;
 }
+
+// Result EnsureSaveData(const account::Uid &uid) (older SDK, Cadence of Hyrule): the save data exists for the local
+// user (MountSaveData makes its working copy); another user has none.
+static void ov_ensure_save(Cpu *c) {
+    ready();
+    ret_x(c, my_uid(arg_p(c, 0)) ? 0 : FS_R_TARGET_NOT_FOUND);
+}
+HOST_OVERRIDE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", ov_ensure_save);

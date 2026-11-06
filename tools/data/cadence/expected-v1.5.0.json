@@ -1,0 +1,18 @@
+{
+  "_comment": "Verified Cadence of Hyrule 1.5.0 outputs from base 1.0.0 plus the cumulative update (title version 458752). Hashes only; no game data.",
+  "title_id": "01000B900D8B0000",
+  "version": 458752,
+  "display_version": "1.5.0",
+  "exefs_sha256": {
+    "main": "d266457bdf6e9701afb0eabe8997fbc3ed7cad2122ee4d9075189836037b8c4e",
+    "main.npdm": "0f6f9923f40f6d2b843a39df969a43ae530d05bd4c39fec82d832084864065f0",
+    "rtld": "6f48768b5ebd6b570a5f784c911fe09e904b806fc7e1f063a8110f2bcadabc61",
+    "sdk": "d3e7f5dd35e0aa618abddeb1b9f05b38c5a94e4788374b4444c32df057fb0f42",
+    "subsdk0": "2c25fea28c5c019e72b59ee62ae539234ab92a8baf11f567bfe97c8390842de9",
+    "subsdk1": "7505e7c1e0a11d2cfc7daa39f0aa4c51632ee2998baaf5d48b9d711d8d729026"
+  },
+  "romfs": {
+    "size": 1815712700,
+    "sha256": "3a565956bbf4d1c08382d3ccc80f119be3190d6e91751a884bf3074a42566b24"
+  }
+}

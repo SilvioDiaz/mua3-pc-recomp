@@ -12,6 +12,8 @@
 #include <windows.h>
 #include <imm.h>
 
+#include "kernel.h"
+#include "vk_exec.h"
 #include "cfg.h"
 #include "flight.h"
 #include "fs.h"
@@ -202,6 +204,8 @@ int gfx_window_monitor_size(int *w, int *h) {
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) kern_dump_threads();   // what a stuck game waits on
+    if (m == WM_KEYDOWN && w == VK_F7 && !(l & (1 << 30))) vk_dump_key();   // the next frames' passes to dump/
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
@@ -364,7 +368,10 @@ static void window_main(void *arg) {
         x = mon.left + (mw > ow ? (mw - ow) / 2 : 0);
         y = mon.top + (mh > oh ? (mh - oh) / 2 : 0);
     }
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, x, y, ow, oh, NULL, NULL, inst, NULL);
+    wchar_t title[128];   // the game's name (rt_game_name), UTF-8 to UTF-16
+    if (!MultiByteToWideChar(CP_UTF8, 0, rt_game_name, -1, title, (int)(sizeof title / sizeof *title)))
+        wcscpy(title, L"Recomp");
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, title, WND_STYLE, x, y, ow, oh, NULL, NULL, inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
         g_wnd_failed = 1;

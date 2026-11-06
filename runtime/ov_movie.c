@@ -31,7 +31,10 @@
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
 
+#include <stdio.h>
+
 #include "cfg.h"
+#include "fs.h"
 #include "host.h"
 #include "movie.h"
 #include "movie_codec.h"
@@ -594,7 +597,7 @@ static void ov_ctor(Cpu *c) {
     guest_init();
     // MUA3 (H.264 video, type 1; its sound, type 4): the library would abort in NvOsDrvOpen, so the decoder stays a
     // host object whose Configure answers "unsupported" until the host decodes those formats.
-    if ((type != MOVIE_TYPE_VP9 && !RT_MUA3) || mode != MOVIE_MODE_BUFFER || host_off()) {
+    if ((type != MOVIE_TYPE_VP9 && RT_TOTK) || mode != MOVIE_MODE_BUFFER || host_off()) {
         rt_log("movie: decoder type %d mode %d format %d left to the library%s", type, mode, format,
                host_off() ? " (TOTK_MOVIE_HOST=0)" : " (only VP9 in buffer mode runs on the host)");
         pass(c, MOVIE_CTOR);
@@ -606,7 +609,9 @@ static void ov_ctor(Cpu *c) {
     m->format = format;
     // DecoderType: 1 H.264 (MUA3's video), 3 VP9 (TotK), 4 the movie's audio (AAC in MUA3)
     m->kind = type == MOVIE_TYPE_VP9 ? KIND_VP9 : type == 4 ? KIND_AAC : KIND_H264;
-    m->paced = m->kind != KIND_AAC;
+    // TotK's player shows one frame per game frame, so its video is paced here; other games' players keep their own
+    // clock (Cadence of Hyrule) and take frames as decoded, as they take the sound.
+    m->paced = m->kind != KIND_AAC && RT_TOTK;
     plat_mutex_init(&m->mu);
     plat_cond_init(&m->work);
     plat_cond_init(&m->idle);
@@ -666,6 +671,103 @@ static void ov_d0(Cpu *c) {
     pass(c, MOVIE_D0);
 }
 
+// ---- avcC from the movie file: MUA3's extractor passes neither csd-0/csd-1 nor in-band SPS/PPS
+static char g_mp4[512];
+static PlatMutex g_mp4_lock = PLAT_MUTEX_INIT;
+void movie_note_open(const char *path) {
+    plat_mutex_lock(&g_mp4_lock);
+    snprintf(g_mp4, sizeof g_mp4, "%s", path);
+    plat_mutex_unlock(&g_mp4_lock);
+}
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+// The first box of kind in [p, p+n) (descending into the containers on the way to avcC); NULL if none.
+static const uint8_t *find_box(const uint8_t *p, size_t n, const char *kind, size_t *len) {
+    static const char *const containers[] = {"moov", "trak", "mdia", "minf", "stbl"};
+    for (size_t off = 0; off + 8 <= n;) {
+        uint64_t size = be32(p + off);
+        size_t hdr = 8;
+        if (size == 1 && off + 16 <= n) {
+            size = (uint64_t)be32(p + off + 8) << 32 | be32(p + off + 12);
+            hdr = 16;
+        }
+        if (size < hdr || off + size > n) return NULL;
+        const uint8_t *body = p + off + hdr;
+        size_t blen = (size_t)size - hdr;
+        if (!memcmp(p + off + 4, kind, 4)) {
+            *len = blen;
+            return body;
+        }
+        for (int i = 0; i < 5; i++)
+            if (!memcmp(p + off + 4, containers[i], 4)) {
+                const uint8_t *r = find_box(body, blen, kind, len);
+                if (r) return r;
+            }
+        if (!memcmp(p + off + 4, "stsd", 4) && blen > 8) {   // version/flags, entry count, then sample entries
+            for (size_t e = 8; e + 8 <= blen;) {
+                uint32_t es = be32(body + e);
+                if (es < 8 || e + es > blen) break;
+                if (!memcmp(body + e + 4, "avc1", 4) && es > 8 + 78) {   // visual sample entry: 78 bytes before boxes
+                    const uint8_t *r = find_box(body + e + 8 + 78, es - 8 - 78, kind, len);
+                    if (r) return r;
+                }
+                e += es;
+            }
+        }
+        off += (size_t)size;
+    }
+    return NULL;
+}
+
+// SPS and PPS (bare NAL units) of the last .mp4 the game opened, from its avcC. 1 on success.
+static int mp4_avcc(uint8_t *sps, int *nsps, uint8_t *pps, int *npps, char *path, size_t pathn) {
+    plat_mutex_lock(&g_mp4_lock);
+    snprintf(path, pathn, "%s", g_mp4);
+    plat_mutex_unlock(&g_mp4_lock);
+    uint64_t h;
+    int64_t fsize = 0;
+    if (!path[0] || romfs_open(&h, path, FS_OPEN_READ)) return 0;
+    romfs_size(&fsize, h);
+    int ok = 0;
+    uint8_t hdr[16];
+    for (int64_t off = 0; off + 8 <= fsize;) {   // top-level boxes: find moov wherever it sits
+        uint64_t got = 0;
+        if (romfs_read(&got, h, off, hdr, 16) || got < 8) break;
+        uint64_t size = be32(hdr);
+        if (size == 1 && got >= 16) size = (uint64_t)be32(hdr + 8) << 32 | be32(hdr + 12);
+        if (size == 0) size = (uint64_t)(fsize - off);
+        if (size < 8) break;
+        if (!memcmp(hdr + 4, "moov", 4) && size < (64u << 20)) {
+            uint8_t *moov = malloc((size_t)size);
+            if (moov && !romfs_read(&got, h, off, moov, size) && got == size) {
+                size_t alen = 0;
+                const uint8_t *a = find_box(moov, (size_t)size, "avcC", &alen);
+                // avcC: version, profile, compat, level, length size, then SPS count (low 5 bits) and length-prefixed
+                // SPS, then PPS count and length-prefixed PPS
+                if (a && alen > 7 && (a[5] & 31) >= 1) {
+                    size_t q = 6;
+                    int ls = a[q] << 8 | a[q + 1];
+                    if (q + 2 + (size_t)ls <= alen && ls <= *nsps) {
+                        memcpy(sps, a + q + 2, (size_t)ls), *nsps = ls;
+                        q += 2 + (size_t)ls;
+                        for (int k = 1; k < (a[5] & 31) && q + 2 <= alen; k++) q += 2 + (size_t)(a[q] << 8 | a[q + 1]);
+                        if (q + 3 <= alen && a[q] >= 1) {
+                            int lp = a[q + 1] << 8 | a[q + 2];
+                            if (q + 3 + (size_t)lp <= alen && lp <= *npps) memcpy(pps, a + q + 3, (size_t)lp), *npps = lp, ok = 1;
+                        }
+                    }
+                }
+            }
+            free(moov);
+            break;
+        }
+        off += (int64_t)size;
+    }
+    romfs_close(h);
+    return ok;
+}
+
 // A codec-specific-data buffer of the format (csd-0, csd-1): its bytes, NULL when the format has none.
 static const uint8_t *md_buffer(Cpu *c, uint64_t md, const char *key, int *n) {
     static uint64_t find_buffer, buf_data, buf_size;
@@ -684,6 +786,35 @@ static const uint8_t *md_buffer(Cpu *c, uint64_t md, const char *key, int *n) {
     return (const uint8_t *)(uintptr_t)p;
 }
 
+// The library's MP4 extractor (stagefright's) keeps an H.264 track's AVCDecoderConfigurationRecord under "avcc" and
+// leaves csd-0/csd-1 to MediaCodec, which the host replaces (Cadence of Hyrule's movies keep SPS and PPS only there).
+// The first SPS and PPS of the record become csd-0 and csd-1, bare NAL units (mc_open adds the start codes).
+// Layout: version, profile, compat, level, 0xfc|length size-1, 0xe0|SPS count, {u16 size, SPS}..., PPS count,
+// {u16 size, PPS}...
+static void avcc_parameter_sets(Cpu *c, uint64_t md, const uint8_t **sps, int *nsps, const uint8_t **pps, int *npps) {
+    int n = 0;
+    const uint8_t *r = md_buffer(c, md, "avcc", &n);
+    if (!r || n < 7 || r[0] != 1) return;
+    int count = r[5] & 31, at = 6;
+    for (int i = 0; i < count; i++) {
+        if (at + 2 > n) return;
+        int len = r[at] << 8 | r[at + 1];
+        if (at + 2 + len > n) return;
+        if (!i) *sps = r + at + 2, *nsps = len;
+        at += 2 + len;
+    }
+    if (at >= n) return;
+    count = r[at++];
+    for (int i = 0; i < count; i++) {
+        if (at + 2 > n) return;
+        int len = r[at] << 8 | r[at + 1];
+        if (at + 2 + len > n) return;
+        if (!i) *pps = r + at + 2, *npps = len;
+        at += 2 + len;
+    }
+    rt_log("movie: H.264 parameter sets from the avcc record: SPS %d bytes, PPS %d bytes", *nsps, *npps);
+}
+
 // Configure for the host codecs: H.264 (video/avc, NV12 out) and AAC (audio/mp4a-latm, 16-bit PCM out).
 static void configure_mc(Cpu *c, Movie *m, uint64_t md) {
     uint64_t mime_p = 0;
@@ -694,6 +825,7 @@ static void configure_mc(Cpu *c, Movie *m, uint64_t md) {
     md_find_int32(c, md, video ? "width" : "sample-rate", &a);
     md_find_int32(c, md, video ? "height" : "channel-count", &b);
     const uint8_t *csd0 = md_buffer(c, md, "csd-0", &n0), *csd1 = md_buffer(c, md, "csd-1", &n1);
+    if (video && !n0) avcc_parameter_sets(c, md, &csd0, &n0, &csd1, &n1);
     rt_log("movie: configure %s %s %dx%d output format %d, csd-0 %d bytes (%02x %02x %02x %02x %02x), csd-1 %d bytes",
            video ? "video" : "audio", mime ? mime : "(none)", a, b, m->format, n0, n0 > 0 ? csd0[0] : 0,
            n0 > 1 ? csd0[1] : 0, n0 > 2 ? csd0[2] : 0, n0 > 3 ? csd0[3] : 0, n0 > 4 ? csd0[4] : 0, n1);
@@ -704,6 +836,17 @@ static void configure_mc(Cpu *c, Movie *m, uint64_t md) {
         rt_log("movie: configure: %s not supported on the host", mime ? mime : "(no mime)");
         ret_x(c, ST_UNSUPPORTED);
         return;
+    }
+    uint8_t sps[512], pps[512];
+    if (video && !n0) {   // no SPS/PPS in the format: the avcC of the file the extractor opened
+        int ns = sizeof sps, np = sizeof pps;
+        char path[512];
+        if (mp4_avcc(sps, &ns, pps, &np, path, sizeof path)) {
+            csd0 = sps, n0 = ns, csd1 = pps, n1 = np;
+            rt_log("movie: SPS %d bytes and PPS %d bytes from the avcC of %s", ns, np, path);
+        } else {
+            rt_log("movie: no SPS/PPS for the H.264 decoder (last .mp4 opened: %s)", path[0] ? path : "none");
+        }
     }
     char err[160];
     MovieCodec *mc = mc_open(video ? MC_H264 : MC_AAC, a, b, csd0, n0, csd1, n1, err, sizeof err);
@@ -947,6 +1090,25 @@ static void ov_send_input(Cpu *c) {
     } else {
         m->pending[m->npending++] = (Pending){index, offset, size, time, flags};
         plat_cond_signal(&m->work);
+        // Other games than TotK (Cadence of Hyrule): the player waits on the decoder's events, which only a guest thread
+        // can signal, and may present nothing until a frame comes. So the call waits for the worker (decoding takes a
+        // few ms, at most 30 here) and hands over and signals what it produced on this thread.
+        if (RT_OTHER_GAME) {
+            int away = 0;
+            for (int tries = 0; (m->npending || m->busy) && tries < 30; tries++) {
+                if (!away) away = kern_core_away();
+                plat_cond_wait_ms(&m->idle, &m->mu, 1);
+            }
+            release_due(m, g_clock());
+            if (away) {
+                collect(m, &s);
+                plat_mutex_unlock(&m->mu);
+                kern_core_back(&away);
+                fire(c, &s);
+                ret_x(c, (uint32_t)st);
+                return;
+            }
+        }
     }
     collect(m, &s);
     plat_mutex_unlock(&m->mu);
@@ -963,7 +1125,10 @@ static void ov_acquire_output(Cpu *c) {
     if (!m) { pass(c, MOVIE_ACQUIRE_OUTPUT); return; }
     if (!index || !time || !flags || !remaining) { ret_x(c, ST_NULL); return; }
     Signals s = {0};
-    plat_mutex_lock(&m->mu);   // paced frames become ready only at presents (movie_tick)
+    plat_mutex_lock(&m->mu);
+    // A due frame becomes ready at a present (movie_tick) or here: Cadence of Hyrule's player waits for a movie's first
+    // frame before it presents anything, so a frame handed over only at presents never came.
+    if (m->started) release_due(m, g_clock());
     *index = -1;
     *time = 0;
     *flags = 0;

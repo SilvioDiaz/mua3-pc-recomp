@@ -216,9 +216,28 @@ static IMFSample *make_sample(const uint8_t *a, int na, const uint8_t *b, int nb
     return s;
 }
 
+// The NAL unit types of an Annex B access unit with their sizes ("9:2 7:25 8:5 5:98000"), for the log.
+static void nal_list(const uint8_t *p, int n, char *out, int cap) {
+    int k = 0, start = -1, type = -1;
+    out[0] = 0;
+    for (int i = 0; i + 3 <= n; i++) {
+        if (p[i] || p[i + 1] || p[i + 2] != 1) continue;
+        if (start >= 0 && k < cap - 16) k += snprintf(out + k, (size_t)(cap - k), "%d:%d ", type, i - start);
+        start = i + 3;
+        type = i + 3 < n ? p[i + 3] & 31 : -1;
+        i += 2;
+    }
+    if (start >= 0 && k < cap - 16) snprintf(out + k, (size_t)(cap - k), "%d:%d", type, n - start);
+}
+
 int mc_feed(MovieCodec *c, const uint8_t *p, int n, int64_t us) {
     com_init();
     if (c->kind == MC_H264 && !start_code(p, n) && to_annexb(c, p, n)) p = c->conv;
+    if (c->kind == MC_H264 && c->nfeed < 6) {
+        char nals[200];
+        nal_list(p, n, nals, sizeof nals);
+        rt_log("movie_codec: H.264 access unit at %lld us, NAL type:size %s", (long long)us, nals);
+    }
     int pre = c->kind == MC_H264 && c->csd_due ? c->ncsd : 0;
     IMFSample *s = make_sample(c->csd, pre, p, n, us);
     if (!s) return fail(c, "making an input sample", E_OUTOFMEMORY);

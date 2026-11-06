@@ -193,6 +193,10 @@ NVN_API(nvnDeviceInitialize) {
     memset(o, 0, sizeof *o);
     o->magic = DEV_MAGIC;
     o->flags = b->flags;
+    // NVN's default depth mode is NEAR_IS_MINUS_W (as GL), which a game that never calls SetDepthMode keeps (Cadence of
+    // Hyrule: its shadow maps hold (z+w)/2 and its shaders compare against that). TotK's tables were made with the
+    // 0..w default this port had, so TotK keeps it.
+    if (RT_OTHER_GAME) __atomic_store_n(&depth_minus_w, 1, __ATOMIC_RELAXED);
     NVN_LOG("DeviceInitialize %p flags %#x, back end %s", (void *)o, o->flags, gfx_backend()->name);
     ret_x(c, 1);
 }
@@ -237,10 +241,16 @@ NVN_API(nvnDeviceInstallDebugCallback) {
     o->dbg_cb = nvn_arg_bool(c, 3) ? arg_p(c, 1) : NULL;
     o->dbg_data = arg_p(c, 2);
 }
+// The window origin of the device: NVN's default is lower left (as GL), which games that never call
+// SetWindowOriginMode keep (Cadence of Hyrule). Rendering stays as it is; such a game draws its frames bottom row
+// first, so the present (gfx_present.c) and the shots (boot.c) turn the picture over.
+static int origin_upper_left;
+int nvn_origin_lower_left(void) { return !__atomic_load_n(&origin_upper_left, __ATOMIC_RELAXED); }
 // void nvnDeviceSetWindowOriginMode(NVNdevice *d, NVNwindowOriginMode mode)
 NVN_API(nvnDeviceSetWindowOriginMode) {
     uint32_t m = (uint32_t)arg_x(c, 1);
     ((dev_t_ *)arg_p(c, 0))->origin = m;
+    __atomic_store_n(&origin_upper_left, m == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT, __ATOMIC_RELAXED);
     NVN_LOG("window origin %s", m ? "upper left (as D3D and Vulkan)" : "lower left (GL)");
 }
 // void nvnDeviceSetDepthMode(NVNdevice *d, NVNdepthMode mode)

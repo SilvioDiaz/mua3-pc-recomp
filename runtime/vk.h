@@ -391,6 +391,9 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
+int vk_texture_buffer_locked(int id, uint64_t *addr, int *format, uint32_t *texels);   // buffer texture of a slot
+void vk_texture_slot_info(int id, char *b, int n);   // why a slot has no image (frame dump)
+const VkTexImage *vk_texture_depth_partner(const VkTexImage *img);   // texture lock held (vk_texture.c)
 VkSampler vk_sampler_by_id_locked(int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
@@ -483,6 +486,8 @@ typedef struct VkPipeState {
                                            // front face is not mirrored
     uint8_t prim_restart;                  // the draw's indices restart its strip or fan at the all-ones value
                                            // (OP_PRIM_RESTART, set by op_draw_idx); dynamic state only
+    float alpha_ref;                       // OP_BIND_STATE kind 7 (SetAlphaRef): reference of color.alpha_func's test,
+                                           // which the fragment shader variant does (vk_pipeline_answers); not in the key
     uint8_t feedback;                      // the fragment shader samples an attachment of the pass in the feedback
                                            // layout: 1 colour, 2 depth/stencil (VK_PIPELINE_CREATE_*_FEEDBACK_LOOP_BIT_EXT)
     blend_st blend[8];                    // OP_BIND_STATE kind 0, indexed by blend_st.target

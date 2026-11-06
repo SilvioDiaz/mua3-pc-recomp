@@ -624,6 +624,65 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     AddVectoredExceptionHandler(1, fault_veh);
 }
 
+// ---- write watch (plat_mem_watch). A write into a watched page faults; watch_veh reports it, makes the page writable
+// and single-steps the writing instruction (trap flag); the single-step trap makes the page read-only again. A thread
+// can have a few pages open at once (a store that crosses a page boundary).
+#define WATCH_MAX 32
+static struct { uint64_t lo, hi; } watch_rng[WATCH_MAX];
+static volatile LONG watch_n;
+static void (*watch_fn)(uint64_t addr, uint64_t exe_off);
+static __thread uint64_t watch_open[4];
+static __thread int watch_nopen;
+
+static int watch_hit(uint64_t a) {
+    for (LONG i = 0, n = watch_n; i < n; i++)
+        if (a >= watch_rng[i].lo && a < watch_rng[i].hi) return 1;
+    return 0;
+}
+
+static LONG CALLBACK watch_veh(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    DWORD old;
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && watch_nopen) {
+        for (int i = 0; i < watch_nopen; i++) VirtualProtect((void *)(uintptr_t)watch_open[i], 4096, PAGE_READONLY, &old);
+        watch_nopen = 0;
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t a = (uint64_t)er->ExceptionInformation[1], page = a & ~4095ull;
+    if (!watch_hit(a) || watch_nopen == 4) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    MODULEINFO mi;
+    uint64_t off = GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof mi) &&
+                           rip - (uintptr_t)mi.lpBaseOfDll < mi.SizeOfImage
+                       ? rip - (uintptr_t)mi.lpBaseOfDll
+                       : 0;
+    if (watch_fn) watch_fn(a, off);
+    if (!VirtualProtect((void *)(uintptr_t)page, 4096, PAGE_READWRITE, &old)) return EXCEPTION_CONTINUE_SEARCH;
+    watch_open[watch_nopen++] = page;
+    ep->ContextRecord->EFlags |= 0x100u;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+int plat_mem_watch(uint64_t addr, uint64_t n, void (*fn)(uint64_t addr, uint64_t exe_off)) {
+    static volatile LONG installed;
+    if (!n || watch_n >= WATCH_MAX) return 0;
+    if (!InterlockedExchange(&installed, 1)) AddVectoredExceptionHandler(1, watch_veh);   // ahead of fault_veh
+    watch_fn = fn;
+    uint64_t lo = addr & ~4095ull, hi = (addr + n + 4095) & ~4095ull;
+    watch_rng[watch_n].lo = lo, watch_rng[watch_n].hi = hi;
+    InterlockedIncrement(&watch_n);
+    for (uint64_t p = lo; p < hi; p += 4096) {
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD old;
+        if (VirtualQuery((void *)(uintptr_t)p, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT)
+            VirtualProtect((void *)(uintptr_t)p, 4096, PAGE_READONLY, &old);
+    }
+    return 1;
+}
+
 static void (*crash_fn)(const PlatCrash *c);
 
 static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {

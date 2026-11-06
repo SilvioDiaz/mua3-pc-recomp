@@ -393,9 +393,6 @@ NVN_API(nvnCommandBufferSetSampleMask) {
     int m = (int)arg_x(c, 1);
     if ((m & 0xffff) != 0xffff) ONCE("SetSampleMask %#x: fixed-function sample mask not applied", m);
 }
-// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): used only with the alpha test, which the replay
-// reports
-NVN_API(nvnCommandBufferSetAlphaRef) { (void)c; }
 // void nvnCommandBufferSetDepthBounds(NVNcommandBuffer *cmd, NVNboolean enable, float min, float max): disabling is
 // exact; an enabled range is drawn without the test and reported
 NVN_API(nvnCommandBufferSetDepthBounds) {

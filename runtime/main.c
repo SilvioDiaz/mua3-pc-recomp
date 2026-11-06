@@ -109,13 +109,15 @@ static void log_open(int game) {
     if (cut && (size_t)(cut - dir) + sizeof "/logs" <= sizeof dir) {
         strcpy(cut, "/logs");
         plat_file_mkdir_p(dir);
-        for (int i = LOG_KEEP - 1; i > 0; i--) {   // totk.3.log -> totk.4.log, ..., totk.log -> totk.1.log
-            if (i > 1) snprintf(from, sizeof from, "%s/totk.%d.log", dir, i - 1);
-            else snprintf(from, sizeof from, "%s/totk.log", dir);
-            snprintf(to, sizeof to, "%s/totk.%d.log", dir, i);
+        // logs/<file>.log, the game's name (rt_game_file): <file>.3.log -> <file>.4.log, ..., <file>.log -> <file>.1.log
+        const char *f = rt_game_file;
+        for (int i = LOG_KEEP - 1; i > 0; i--) {
+            if (i > 1) snprintf(from, sizeof from, "%s/%s.%d.log", dir, f, i - 1);
+            else snprintf(from, sizeof from, "%s/%s.log", dir, f);
+            snprintf(to, sizeof to, "%s/%s.%d.log", dir, f, i);
             if (plat_file_exists(from)) plat_file_replace(from, to);
         }
-        snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", dir);
+        snprintf(g_log_path, sizeof g_log_path, "%s/%s.log", dir, f);
         g_log_file = plat_append_open(g_log_path);
     }
     if (!g_log_file) {
@@ -154,8 +156,7 @@ static RtConfig cfg;
 const RtConfig *rt_config(void) { return &cfg; }
 
 // ---- runtime services the generated code calls (cpu.h)
-volatile int g_fnprof = 0;   // resolution.c switches it on until the game sets its render size (res_fn_hit)
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)lr, res_fn_hit(addr, x0); }
+// g_fnprof and fnprof_hit (FN_ENTER) live in fnprof.c: resolution.c's render-size watch and the profiler share them.
 
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
     char at[128], lr[128];

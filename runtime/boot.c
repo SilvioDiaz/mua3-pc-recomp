@@ -97,7 +97,7 @@ static void module_inits_any(Cpu *c) {
 
 static void cb_module_inits(Cpu *c) {
     if (plat_cas32(&inits_done, 0, 0)) rt_fatal("boot: module constructors requested twice");
-    if (RT_MUA3) {
+    if (RT_OTHER_GAME) {
         module_inits_any(c);
         plat_xchg32(&inits_done, 1);
         return;
@@ -135,7 +135,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
     const RtLoaded *main_mod = module_named("main");
     uint64_t ret = c->x[30];
     caller(c, at, sizeof at);
-    if (RT_MUA3) {
+    if (RT_OTHER_GAME) {
         // The return addresses checked below are TotK's: here the events are logged with the caller instead, and
         // --boot still ends at the first NVN call.
         rt_logf("boot: %s %s from %s\n", what, detail ? detail : "", at);
@@ -245,6 +245,21 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
     free(raw);
 }
 
+// A game with the lower-left window origin (nvn_origin_lower_left) draws its frames bottom row first: turned over,
+// the shot shows what the present shows.
+static void shot_rows_upright(uint8_t *px, uint32_t w, uint32_t h) {
+    if (!nvn_origin_lower_left()) return;
+    uint8_t *row = malloc(4ull * w);
+    if (!row) rt_fatal("boot: out of memory for the shot");
+    for (uint32_t y = 0; y < h / 2; y++) {
+        uint8_t *a = px + 4ull * w * y, *b = px + 4ull * w * (h - 1 - y);
+        memcpy(row, a, 4ull * w);
+        memcpy(a, b, 4ull * w);
+        memcpy(b, row, 4ull * w);
+    }
+    free(row);
+}
+
 static void save_shot(const tex_t *t, const char *path) {
     int fmt = t->d.format;
     int bgra = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
@@ -264,6 +279,7 @@ static void save_shot(const tex_t *t, const char *path) {
             px[i] = px[i + 2];
             px[i + 2] = x;
         }
+    shot_rows_upright(px, w, h);
     rt_write_png(path, px, w, h);
     free(px);
     rt_logf("boot: shot %s (%ux%u)\n", path, w, h);
@@ -308,6 +324,7 @@ static void series_shot(const tex_t *t, uint64_t n) {
     NVNcopyRegion r = {.width = (int)w, .height = (int)h, .depth = 1};
     if (gfx_replay_async()) gfx_backend()->finish();   // the presented frame may still be queued for the replay
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
+    shot_rows_upright(px, w, h);
     for (uint32_t y = 0; y < oh; y++)
         for (uint32_t x = 0; x < ow; x++) {
             uint32_t x0 = x * w / ow, x1 = (x + 1) * w / ow, y0 = y * h / oh, y1 = (y + 1) * h / oh;

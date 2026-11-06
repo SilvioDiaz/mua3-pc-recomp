@@ -1,0 +1,18 @@
+{
+  "_comment": "Verified Cadence of Hyrule 1.0.0 (base game) outputs. Hashes only; no game data.",
+  "title_id": "01000B900D8B0000",
+  "version": 0,
+  "display_version": "1.0.0",
+  "exefs_sha256": {
+    "main": "7ad82378b7198c050c40aaf028f304dafdf6050c1a462e1e2896b9adcdcbfaab",
+    "main.npdm": "d0048454d63c82d5d2b438771511d95b412da831b3b142230c3b6f80ccd40fed",
+    "rtld": "6f48768b5ebd6b570a5f784c911fe09e904b806fc7e1f063a8110f2bcadabc61",
+    "sdk": "d3e7f5dd35e0aa618abddeb1b9f05b38c5a94e4788374b4444c32df057fb0f42",
+    "subsdk0": "2c25fea28c5c019e72b59ee62ae539234ab92a8baf11f567bfe97c8390842de9",
+    "subsdk1": "7505e7c1e0a11d2cfc7daa39f0aa4c51632ee2998baaf5d48b9d711d8d729026"
+  },
+  "romfs": {
+    "size": 682324812,
+    "sha256": "1284b8f5258e65abb04ded4fcf2852291846dca6ab25b0c64274e258df947a8b"
+  }
+}

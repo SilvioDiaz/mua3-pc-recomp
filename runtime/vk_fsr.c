@@ -21,6 +21,7 @@
 #include "fsr_easu_spv.h"
 #include "fsr_rcas_spv.h"
 #include "host.h"
+#include "nvn_api.h"
 
 #define SLOTS 8
 
@@ -207,10 +208,13 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
             XF, VK_ACCESS_2_TRANSFER_READ_BIT);
     // later submissions that write the source wait for the compute read
     barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+    // The lower-left window origin (nvn_origin_lower_left): the frame holds its bottom row first, so the copy to the
+    // swapchain turns it over, as the bilinear present in gfx_present.c does.
+    int flip = nvn_origin_lower_left(), y0 = out[1], y1 = out[1] + (int)dh;
     VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                           .srcOffsets = {{0, 0, 0}, {(int)dw, (int)dh, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                          .dstOffsets = {{out[0], out[1], 0}, {out[0] + (int)dw, out[1] + (int)dh, 1}}};
+                          .dstOffsets = {{out[0], flip ? y1 : y0, 0}, {out[0] + (int)dw, flip ? y0 : y1, 1}}};
     vkCmdBlitImage(cb, F.img[last], VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                    VK_FILTER_NEAREST);
     return 1;

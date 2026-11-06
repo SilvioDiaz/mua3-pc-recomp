@@ -1,92 +1,124 @@
-# TotK Recomp
+# MUA3 Recomp
 
-**TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
+A static recompilation of *Marvel Ultimate Alliance 3: The Black Order* (Nintendo Switch) into a native x86-64 Windows
+executable. The game's ARM64 code is turned into C and compiled for PC; this is not an emulator.
+
+> [!WARNING]
+> **This project was made by AI.** Nearly all of the code, the porting work and this documentation were written by an
+> AI coding agent (Claude Code, by Anthropic) at the repository owner's request; the owner tested the builds on their
+> own PC.
+>
+> **It is based on [totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)** by Valiantsin Dzerakh (the *Tears
+> of the Kingdom* recomp). The lifter, the runtime and almost everything else come from there; this repository adapts
+> it to another game. The original credits and licenses still apply (see [Credits](#credits)).
+>
+> **The game is not playable yet.** See the status below.
 
 > [!IMPORTANT]
-> **No game files are included.** You need your own legally obtained copy of *Tears of the Kingdom*, dumped from your own console: the base game and the 1.1.0, 1.2.1 or 1.4.3 update. Instructions for obtaining those files will not be provided.
+> **No game files are included.** You need your own copy of the game, dumped from your own console. Instructions for
+> obtaining those files will not be provided.
 >
-> The game is built from your files on your machine, so the result contains the game. It is for your own use. Do not share it.
+> The game is built from your files on your machine, so the result contains the game. It is for your own use. Do not
+> share the build folder.
 
 ## Status
 
-Early development. The game is playable on Windows and Linux; visual bugs and crashes are still expected.
+| Stage | State |
+| --- | --- |
+| Recompilation (104,614 functions, 0 unsupported instructions) | ✅ |
+| Boot, initialisation, audio, gamepad, user account and save data | ✅ |
+| Marvel logo, title screen and main menu | ✅ |
+| H.264 movies (opening cutscene with sound and subtitles) | ✅ |
+| Reaching gameplay (first stage, HUD, checkpoint) | ✅ about 30 fps |
+| Lit 3D scene (characters and level) | ❌ almost black |
+| Actually playing, finishing the game | ❌ untested |
+| DLC (Expansion Pass), online, Linux | ❌ |
 
-Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
+### Logo, title screen and menu
 
-## Features
+![Marvel logo](docs/images/01-logo-marvel.jpg)
 
-- Native code, not emulation
-- Game updates 1.1.0, 1.2.1 and 1.4.3; 1.2.1 and 1.4.3 saves carry over between them
-- Takes NSP and XCI game files, and compressed NSZ and XCZ as they are: the setup unpacks them itself
-- 60 fps by default; up to 144 fps or the monitor's refresh rate (experimental)
-- Custom resolutions (1080p, 2k...), supersampling and AMD FSR 1 upscaling
-- NVIDIA DLSS / DLAA on RTX GPUs: the setup downloads `nvngx_dlss.dll` from NVIDIA's DLSS SDK repository
-  (github.com/NVIDIA/DLSS, NVIDIA RTX SDK license) when it finds an RTX GPU; untick it in the setup to skip it
-- HDR10 output with peak, game and HUD brightness settings
-- 16:10 (Steam Deck, handhelds), 3:2 (Surface, Framework), 21:9 and 32:9 (ultrawide) game resolutions, with the camera and the interface in that shape
-- Anisotropic texture filtering up to 16x, for sharp ground into the distance
-- In-game settings menu (F1) and performance overlay (F10)
-- Discord Rich Presence ("Playing TotK Recomp" with the play time), off by default, own application id supported
-- Setup and in-game menu in English, Russian, Brazilian Portuguese and Simplified Chinese
-- Keyboard, mouse and gamepad with remapping, rumble and gyro
-- Stereo or 5.1 surround sound output
-- Xbox button prompts: LB, RB, LT, RT, Menu and View, and A, B, X and Y as labelled on the button to press, with either button layout
-- Shaders prepared at install instead of during play
-- Mods made for emulators: unpack a mod into the `mods` folder next to `totk.exe`; switch and order them in the menu. RomFS
-  mods, TKMM's merged output and ExeFS code patches (`.ips`, `.pchtxt`) work; the game rebuilds itself for code patches
-  ([docs/mods.md](docs/mods.md))
-- Atmosphère cheats: put a cheat file into a mod and switch its cheats in the menu ([docs/cheats.md](docs/cheats.md))
+![Title screen](docs/images/02-titulo.jpg)
 
-## Planned
+![Main menu](docs/images/03-menu.jpg)
 
-- VRR
+### Opening cutscene
 
-## Installing
+The new-game movie plays to the end with sound and subtitles (decoded with Windows Media Foundation).
 
-### Windows
+![Cutscene: the Guardians of the Galaxy on their ship](docs/images/04-cutscene-nave.jpg)
 
-Requirements: Windows 10 or later, an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a faster build), a GPU with Vulkan 1.3 and `VK_EXT_external_memory_host`, about 36 GiB free during setup (20 GiB after).
+![Cutscene: Drax](docs/images/05-cutscene-drax.jpg)
 
-1. Download `TotK-Setup-<version>-windows.zip` from [Releases](../../releases/latest) and unpack it.
-2. Start `TotK-Setup.exe`. If SmartScreen warns about an unsigned app, choose *More info*, then *Run anyway*.
-3. Pick your game files, the language and an install folder, and press *Start*. The setup builds the game once. With
-   an NVIDIA RTX GPU it also downloads NVIDIA DLSS, unless you untick *Download NVIDIA DLSS*; turn DLSS on in the
-   menu (F1).
-4. Play `totk.exe` from the install folder.
+![Cutscene: Gamora](docs/images/06-cutscene-gamora.jpg)
 
-### Linux
+### Gameplay (the current problem)
 
-Requirements: as on Windows, plus Linux 6.7 or later and glibc 2.34 or later (Ubuntu 22.04, Debian 12, Fedora 35, SteamOS 3).
+The game enters the first stage: the HUD, team portraits, objective text and checkpoint show up, but the scene is dark
+and the characters are silhouettes.
 
-1. Download `TotK-Setup-x86_64.AppImage` from [Releases](../../releases/latest), or build it ([docs/installer.md](docs/installer.md), "Linux release").
-2. Make it executable (`chmod +x TotK-Setup-x86_64.AppImage`) and start it. On a Steam Deck, do this in Desktop Mode.
-3. Pick your game files, the language and an install folder, and press *Start*.
-4. Play `totk` from the install folder.
+![Dark gameplay](docs/images/07-gameplay.jpg)
 
-To update, run a newer setup on the same folder; saves and settings are kept. Settings are in the in-game menu and in `totk.ini` ([totk.ini.example](totk.ini.example) lists every key). Controls: [docs/controls.md](docs/controls.md).
+The depth buffer of the same frame shows that the geometry is there, in the right place:
 
-## Credits
+![Depth buffer of the same frame](docs/images/08-gameplay-profundidade.jpg)
 
-TotK Recomp builds on the projects below. What was taken from each, with its license, is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+What is known so far: the G-buffer draws are `DrawElementsIndirect` calls whose arguments should be filled in by a
+culling step, and they all arrive with an index count of 0. Nothing is drawn into the colour targets, so the lighting
+pass multiplies by zero. The CPU only initialises that block; what should fill it has not been found yet. Details,
+ruled-out hypotheses and next steps are in [docs/mua3-port.md](docs/mua3-port.md) (in Portuguese).
 
-- [LAS Recomp](https://github.com/peiikai/LASRecomp)
-- [MacNativeGames](https://github.com/ly05010419/MacNativeGames)
-- [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) and [nxnative](https://github.com/seedds/nxnative)
-- [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp)
-- [Ryujinx](https://github.com/Ryujinx/Ryujinx)
-- [deko3d](https://github.com/devkitPro/deko3d)
-- [hactool](https://github.com/SciresM/hactool)
-- [SDL 3](https://libsdl.org), [Dear ImGui](https://github.com/ocornut/imgui), [AMD FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [libopus](https://opus-codec.org), [libvpx](https://chromium.googlesource.com/webm/libvpx), [Zstandard](https://github.com/facebook/zstd)
-- [Switchbrew](https://switchbrew.org) and the Switch homebrew community
+## What was adapted from TotK Recomp
 
-## License
+- An `mua3` game profile (title ids, versions, expected hashes) in [tools/game_profile.py](tools/game_profile.py) and
+  [tools/data/mua3](tools/data/mua3); `build_game.py --game mua3` produces `mua3.exe`, `mua3.ini` and `logs\mua3.log`.
+- Boot with MUA3's older SDK (`nn::init::Start` with 2 callbacks); TotK-specific patches turned off.
+- Offline answers for network services (sockets, BCAT, friends, shop), account, save data, empty DLC list, the older
+  hid API, `audout`.
+- NVN to Vulkan: per-stage programs, indirect draws, alpha test, compute shared memory size, textures bound through
+  image handles, and many newly implemented NVN calls.
+- H.264 + AAC movie decoding (`runtime/movie_codec_win.c`), with SPS/PPS read from the MP4's `avcC`.
+- Shader translator (from Ryujinx) with NaN/Inf fixes and Maxwell's FMZ and NaN-aware min/max/clamp behaviour.
+- A function profiler (`TOTK_FNPROF`) and a write tracer to investigate the dark scene.
 
-The project's own code is under the [MIT License](LICENSE); third-party code keeps its own license ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The license grants nothing for Nintendo's game.
-
-TotK Recomp is an independent, non-commercial fan project, not affiliated with or endorsed by Nintendo. *The Legend of Zelda*, *Tears of the Kingdom* and *Nintendo Switch* are trademarks of Nintendo.
+Fixes were also brought over from other open recomps: Cadence of Hyrule, Astral Chain, Xenoblade Chronicles X, Fire
+Emblem: Three Houses and Pokopia (GPL code was only read for behaviour and rewritten, never copied).
 
 ## Building from source
 
-[docs/building.md](docs/building.md) lists the toolchain and the steps. Everything the build writes stays under `build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit. Testers: [docs/tester-guide.md](docs/tester-guide.md).
+Windows only, game version **4.0.1** only (base game 1.0.0 + the 4.0.1 update). There is no installer or release yet.
 
-Most of the code and documentation is written by AI coding agents (Claude Code) under the maintainer's direction; the maintainer plays every build and decides what is merged. [AGENTS.md](AGENTS.md) holds the rules they work under.
+Requirements: MSYS2 UCRT64 (clang/lld, ninja, SDL3, opus, libvpx, zstd, Vulkan headers), Python 3.12 and 3.14, the
+.NET SDK and Visual Studio Build Tools (for the shader translator), a GPU with Vulkan 1.3 and about 60 GB free.
+
+You need the base game and the update (NSP or NSZ) and your console's `prod.keys`. From the repository folder:
+
+```bash
+.venv-py314\Scripts\python -I tools\mua3_extract.py --base base.nsp --update update.nsp --keys prod.keys
+.venv\Scripts\python recomp\gen.py --exefs build\extracted\upd\exefs --out generated\upd --modules main,subsdk0,subsdk1,sdk
+.venv\Scripts\python tools\build_game.py --game mua3 --version upd --gen generated\upd --out build\upd --exefs build\extracted\upd\exefs --romfs build\extracted\upd\romfs --expected build\extracted\expected-upd.json
+build\upd\mua3.exe
+```
+
+The general process is the original project's ([docs/building.md](docs/building.md)). Everything the build writes
+stays under `build\` and `generated\`, which git ignores. Run `tools/check_content.py --staged` before every commit so
+that no game content enters the repository.
+
+## Credits
+
+- [totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) by Valiantsin Dzerakh: the base of this whole project
+- The projects totk-pc-recomp builds on, listed with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md):
+  LAS Recomp, MacNativeGames, Ryujinx, deko3d, hactool, SDL 3, Dear ImGui, AMD FSR 1, Vulkan Memory Allocator,
+  libopus, libvpx, Zstandard, bcdec, Switchbrew and the Switch homebrew community
+- Fixes ported from other recomps: cadence-pc-recomp, astral-chain-pc-recomp, xcx-recomp, fe3h-recomp and
+  switch2-recomp (Pokopia)
+
+## License
+
+The project's code is under the original project's [MIT License](LICENSE); third-party code keeps its own license
+([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The license grants nothing for the game.
+
+An independent, non-commercial fan project, not affiliated with or endorsed by Nintendo, Marvel, Disney or Koei Tecmo /
+Team Ninja. *Marvel Ultimate Alliance 3* and its characters are trademarks of Marvel; *Nintendo Switch* is a trademark
+of Nintendo. The screenshots above were taken from the game running from the owner's own copy and only document the
+port's progress.

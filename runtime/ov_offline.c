@@ -184,3 +184,10 @@ static void crypto_random(Cpu *c) {
         rt_fatal("nn::crypto::GenerateCryptographicallyRandomBytes: %llu bytes failed", (unsigned long long)n);
 }
 HOST_OVERRIDE("_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", crypto_random);
+
+// void nifm::SubmitNetworkRequestAndWait(): the request ends at once, unfulfilled (IsNetworkAvailable stays false)
+OFFLINE(nifm_submit_wait, "nn::nifm::SubmitNetworkRequestAndWait", 0)
+HOST_OVERRIDE("_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", nifm_submit_wait);
+// void ec::ShowShopApplicationInformation(ApplicationId): the eShop page is not shown
+OFFLINE(ec_shop_app, "nn::ec::ShowShopApplicationInformation (eShop not available)", 0)
+HOST_OVERRIDE("_ZN2nn2ec30ShowShopApplicationInformationENS_13ApplicationIdE", ec_shop_app);

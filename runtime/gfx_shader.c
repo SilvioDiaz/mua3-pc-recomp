@@ -51,8 +51,9 @@
 #define KEY_VERSION 4                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids);
                                                            // translator changes are covered by its identity
-#define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
+#define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
+                                                           // (2: alpha test function and reference)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
 #define USE_VERSION 1
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
@@ -694,6 +695,14 @@ static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
     int bytes = (handle & 0x3fff) * 4;
     if (kind == GFX_RES_IMG) return bytes >= 0x120 && bytes < 0x168 ? (bytes - 0x120) / 8 : -1;
     if (separate) return bytes >= 0x168 && bytes < 0x568 ? (bytes - 0x168) / 8 : -1;
+    // A texture at an image handle: Ryujinx turns a storage image's size query (SUQ) into a texture size query on the
+    // image's handle. GFX_TEX_AT_IMG + image slot: the replay binds the image slot's texture (vk_exec_draw.c
+    // tex_handle). MUA3's fog-volume clear (local size 16x16) reads the volume's size this way; with nothing bound it
+    // saw a 1x1x1 stand-in and cleared one texel.
+    // TOTK_TEX_AT_IMG=1 turns it on: with it the whole screen went black in MUA3 (run 19), not understood yet.
+    static int at_img = -1;
+    if (at_img < 0) at_img = rt_knob("TEX_AT_IMG", "0");
+    if (at_img && bytes >= 0x120 && bytes < 0x168) return GFX_TEX_AT_IMG + (bytes - 0x120) / 8;
     return bytes >= 0x20 && bytes < 0x120 ? (bytes - 0x20) / 8 : -1;
 }
 
@@ -1059,6 +1068,8 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     for (int i = 0; i < 3; i++) *p++ = (uint8_t)a->local[i], *p++ = (uint8_t)(a->local[i] >> 8);
     put_u32(&p, a->shared_bytes);
     *p++ = (uint8_t)(a->depth_minus_w | (a->mvprev ? 0x80 : 0));
+    *p++ = a->alpha_func;
+    memcpy(p, &a->alpha_ref, 4), p += 4;
     return (size_t)(p - o);
 }
 
@@ -1091,6 +1102,7 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     memcpy(o->local, a->local, sizeof o->local);
     o->shared_bytes = a->shared_bytes;
     o->mvprev = a->mvprev;   // another translation, not an answer the use mask covers
+    o->alpha_func = a->alpha_func, o->alpha_ref = a->alpha_ref;   // set for fragment shaders only (vk_pipeline_answers)
 }
 
 // The cache key of an input id under the current translator.
@@ -1157,6 +1169,15 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         for (int i = 0; i < 8; i++)
             if (a->frag_out_type[i]) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, attr_name(a->frag_out_type[i])), sep = ",";
         o += sprintf(o, "},\"shared\":%u", a->shared_bytes);
+        if (a->alpha_func) {   // the reference as its bits: the translator compares against this exact float
+            uint32_t bits;
+            memcpy(&bits, &a->alpha_ref, 4);
+            o += sprintf(o, ",\"alpha_test\":%u,\"alpha_ref_bits\":%u", a->alpha_func, bits);
+            static int said;
+            if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+                rt_log("gfx_shader: first fragment shader with an alpha test (func %u, ref %g)", a->alpha_func,
+                       (double)a->alpha_ref);
+        }
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
@@ -1273,8 +1294,26 @@ static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control,
     return translate(r, stage, control, code, a);
 }
 
+// The answers with a compute program's shared memory size from its NVN control section (+0x754, after the workgroup
+// size at +0x748) when the caller gave none. Ryujinx otherwise declares its default 4 KiB: MUA3's skinning computes
+// (local size 64) need 4656 bytes, and their stores past 4 KiB faulted the GPU ("instruction pointer") once their
+// buffer textures held real data. Part of the answers, so such programs get their own cache keys.
+static const GfxShaderAnswers *with_shared(int stage, const uint8_t *control, const GfxShaderAnswers *a,
+                                           GfxShaderAnswers *tmp) {
+    uint32_t bytes;
+    if (stage != GFX_STAGE_CS || !control || (a && a->shared_bytes)) return a;
+    memcpy(&bytes, control + 0x754, 4);
+    if (!bytes || bytes > 0xc000) return a;                // Maxwell's limit is 48 KiB
+    if (a) *tmp = *a;
+    else memset(tmp, 0, sizeof *tmp);
+    tmp->shared_bytes = bytes;
+    return tmp;
+}
+
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                 const uint8_t *c1, const GfxShaderAnswers *a) {
+    GfxShaderAnswers tmp;
+    a = with_shared(stage, control, a, &tmp);
     Req r;
     if (!req_init(&r, stage, control, code, code_size, c1, a)) return NULL;
     const GfxShader *s = get_one(&r, stage, control, code, a);
@@ -1487,6 +1526,8 @@ static void xlate_worker(void *arg) {
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                       const GfxShaderAnswers *a, int *pending) {
     *pending = 0;
+    GfxShaderAnswers tmp;
+    a = with_shared(stage, control, a, &tmp);
     Req r;
     if (!req_init(&r, stage, control, code, code_size, NULL, a)) return NULL;
     const GfxShader *s = get_async_one(r, stage, control, code, a, pending);
@@ -1545,6 +1586,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
                                   const GfxShaderAnswers *a) {
     int pending;
     const GfxShader *s = gfx_shader_get_async(stage, control, code, code_size, a, &pending);
+    GfxShaderAnswers tmp;
+    a = with_shared(stage, control, a, &tmp);
     Req r;
     if (!pending || !req_init(&r, stage, control, code, code_size, NULL, a)) return s;
     uint64_t p0 = perf_begin();   // the wait counts as the render thread's translation time
@@ -1763,8 +1806,8 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 //                       code[length], c1. One per code hash; written before the answers that name it. Game content:
 //                       it stays in the ignored pipeline cache directory.
 // A file with another header is rewritten; a torn tail (killed process) is cut off at open.
-#define ANS_VERSION 1
-#define ANS_PACKED 147                                     // pack_answers' size
+#define ANS_VERSION 2
+#define ANS_PACKED 152                                     // pack_answers' size
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
 #define PRG_VERSION 1
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
@@ -1830,7 +1873,9 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     memcpy(a->frag_out_type, p, 8), p += 8;
     for (int i = 0; i < 3; i++) a->local[i] = (uint16_t)(p[0] | p[1] << 8), p += 2;
     memcpy(&a->shared_bytes, p, 4), p += 4;
-    a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7;
+    a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7, p++;
+    a->alpha_func = *p++;
+    memcpy(&a->alpha_ref, p, 4);
 }
 
 // Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.

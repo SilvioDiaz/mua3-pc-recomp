@@ -221,6 +221,7 @@ static void replay_main(void *arg) {
             free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
+            fnprof_frame(frame);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
         }
         plat_mutex_lock(&rl);

@@ -75,13 +75,15 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
                                   fw[i].h, fw[i].fmt, fw[i].n);
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
-           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu; targets%s",
+           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu; ub updates %llu game barriers "
+           "%llu (in pass %llu); targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
            (unsigned long long)f->clears, (unsigned long long)f->copies, (unsigned long long)f->dispatches,
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
-           (unsigned long long)f->fb_layouts, list);
+           (unsigned long long)f->fb_layouts, (unsigned long long)f->ub_updates, (unsigned long long)f->game_barriers,
+           (unsigned long long)f->barriers_in_pass, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
 }
@@ -578,6 +580,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     resolve_rt(ex);
     vk_contact_pass_begin(ex);
     vk_dlaa_pass(ex);   // DLAA runs before the bloom chain's first pass (vk_dlaa.c)
+    if (vk_dump_armed) vk_dump_pass_begin(ex);   // TOTK_DUMP_PASS: the targets before a chosen pass
     // Learned targets (VkTexImage.fb_learned) are attached in the feedback layout
     VkImage want[9];
     VkImageAspectFlags wasp[9];
@@ -635,6 +638,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     vk_exec_frame.passes++;
     ex->recorded++;
     ex->in_pass = 1;
+    ex->pass_stores = 0;
 }
 
 void vk_exec_pass_end(VkExec *ex) {
@@ -808,6 +812,23 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // A part also spans at least TOTK_SPLIT_US (1000) of replay time: a split costs about 40 us of the render thread
 // (vkQueueSubmit2, a command buffer, the mirror prologue), and a fight frame of 2,000 draws made 15 parts on the 7900X;
 // a millisecond of recording is a fraction of a millisecond of GPU work, so the GPU still starts early.
+// A game Barrier inside an open pass. Cadence of Hyrule calls nvnCommandBufferBarrier before nearly every draw, and a
+// full barrier ends the pass: its shadow map (2048x2048 depth) was loaded and stored once per draw, 1,300 passes a
+// frame and 17 ms of RTX 3060 time in dark rooms. Inside a pass every earlier write outside it is already visible (the
+// pass began behind a full barrier), draws keep their attachment order (rasterization order), and a draw that samples
+// an attachment the pass wrote gets its own barrier or restart (feedback_prepare). What is left is a draw of the pass
+// writing a storage buffer or image: then the barrier ends the pass as before. TOTK_KEEP_PASS=0 always ends it; with
+// TOTK_FEEDBACK=0 the feedback guard is off, so the pass ends too.
+static int keep_pass(const VkExec *ex) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_KEEP_PASS");
+        on = !(e && !strcmp(e, "0")) && vk_ctx()->feedback != VK_FEEDBACK_OFF;
+        rt_log("vk: game barriers inside a pass %s", on ? "keep it open unless a draw of it stored to memory" : "end it");
+    }
+    return on && ex->in_pass && !ex->pass_stores;
+}
+
 static int split_n = -1, split_draws, part_start;
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
@@ -898,7 +919,11 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         }
         case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
-        case OP_BARRIER: vk_exec_barrier(ex); break;
+        case OP_BARRIER:
+            vk_exec_frame.game_barriers++;
+            if (keep_pass(ex)) vk_exec_frame.barriers_in_pass++;
+            else vk_exec_barrier(ex);
+            break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;

@@ -25,6 +25,8 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn_tex.h"
+#include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -41,7 +43,7 @@
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_TEXBUF, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -650,9 +652,12 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
     return 1;
 }
 
-// The program that serves NVN stage st: the one bound for that stage, else the last one bound.
+// The program that serves NVN stage st: the one bound for that stage, else the last one bound. A stage a
+// BindProgram(NULL, stages) unbound has none (OP_BIND_PROGRAM).
 static inline const prog_t *prog_of(const VkExec *ex, int st) {
-    const prog_t *p = (unsigned)st < 6 ? ex->stage_prog[st] : NULL;
+    if ((unsigned)st >= 6) return ex->prog;
+    if (ex->prog_unbound & (1u << st)) return NULL;
+    const prog_t *p = ex->stage_prog[st];
     return p ? p : ex->prog;
 }
 
@@ -698,7 +703,11 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
     view_t v;
     int hv;
     const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-    return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+    if (img) return (uint8_t)gfx_type_of(img, &v, hv);
+    uint64_t addr;
+    int fmt;
+    uint32_t n;
+    return h && vk_texture_buffer_locked((int)(h & 0xfffff), &addr, &fmt, &n) ? GFX_TEX_BUFFER : 0;
 }
 
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
@@ -910,6 +919,14 @@ static void limits_init(void) {
 static int mo_ovr_on;
 static VkDescriptorBufferInfo mo_ovr[2][32];   // [vertex, fragment][slot]; buffer 0: not replaced
 
+// The bound handle of TEX slot `slot` of stage st: a texture slot, or (GFX_TEX_AT_IMG + n) image slot n; 0 when out of
+// range.
+static inline uint64_t tex_handle(const VkExec *ex, int st, int slot) {
+    if (slot >= 0 && slot < 128) return ex->tex[st][slot];
+    if (slot >= GFX_TEX_AT_IMG && slot < GFX_TEX_AT_IMG + 32) return ex->img[st][slot - GFX_TEX_AT_IMG];
+    return 0;
+}
+
 static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
     if (mo_ovr_on && (st == NVN_STAGE_VS || st == NVN_STAGE_FS) && slot >= 0 && slot < 32 && mo_ovr[st][slot].buffer)
         return mo_ovr[st][slot];
@@ -1102,7 +1119,7 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     for (int r = 0; r < n; r++)
         for (int k = 0; k < (res[r].count ? res[r].count : 1); k++) {
             int slot = res[r].slot + k;
-            uint64_t h = slot >= 0 && slot < 128 ? ex->tex[NVN_STAGE_FS][slot] : 0;
+            uint64_t h = tex_handle(ex, NVN_STAGE_FS, slot);
             if (!h) continue;
             typeof(FM[0]) *f = &FM[(h * 0x9E3779B97F4A7C15ull) >> 51];
             if (memo && f->h == h && slot_still(&f->gen, f->tok, h, gen)) {
@@ -1162,6 +1179,17 @@ static void feedback_barrier(VkExec *ex) {
     ex->recorded++;
     ex->fb_dirty = 0;
     vk_exec_frame.fb_barriers++;
+}
+
+// 1 when shader s writes memory: a storage image, or a storage buffer it stores into (vk_exec.c keep_pass).
+static int shader_stores(const GfxShader *s) {
+    if (!s) return 0;
+    const GfxShaderRes *r;
+    if (gfx_shader_resources(s, GFX_RES_IMG, &r)) return 1;
+    int n = gfx_shader_resources(s, GFX_RES_SSBO, &r);
+    for (int i = 0; i < n; i++)
+        if (r[i].flags & 1) return 1;
+    return 0;
 }
 
 // Marks the attachments the draw with state s writes: colour targets with a nonzero effective write mask, depth with
@@ -1225,6 +1253,10 @@ static void tex_info_lookup(VkExec *ex, const GfxShaderRes *r, uint64_t h, int s
                       .separate = (uint8_t)separate, .valid = 1, .image = image, .out = *out};
 }
 
+// TOTK_TRACE_3D: the dispatch whose resources are being bound (NULL for a draw), named when it binds a 3D storage image.
+static const GfxShader *trace_cs;
+static uint32_t trace_groups[3];
+
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image) {
     int ms = (r->type & 0x200) != 0;
@@ -1238,6 +1270,23 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
         if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
+        if (img && storage && img->type == VK_IMAGE_TYPE_3D) {
+            static int on = -1;
+            static volatile int32_t lines;
+            if (on < 0) on = rt_knob("TRACE_3D", "0");
+            if (on && plat_inc32(&lines) <= 100) {
+                const uint8_t *id = trace_cs ? gfx_shader_input_id(trace_cs) : NULL;
+                float c3[4] = {-1, -1, -1, -1};   // the cs uniform block 3 now (the shader stores its first vec4)
+                const p_bind_buf *u3 = &ex->ubo[NVN_STAGE_CS][0];
+                const uint8_t *snap = trace_cs && u3->addr && u3->size >= 16 ? vk_usnap_bytes(u3->addr, 16) : NULL;
+                if (snap) memcpy(c3, snap, 16);   // as of the submit (what the GPU reads)
+                else if (trace_cs && u3->addr && u3->size >= 16 && !nvn_gpu_only(u3->addr)) memcpy(c3, (const void *)(uintptr_t)u3->addr, 16);
+                rt_log("vk: trace3d: storage image %ux%ux%u at %#llx bound by %s %02x%02x%02x%02x%02x%02x%02x%02x groups %ux%ux%u c3 %g %g %g %g",
+                       img->width, img->height, img->depth, (unsigned long long)img->addr, trace_cs ? "cs" : "a draw",
+                       id ? id[0] : 0, id ? id[1] : 0, id ? id[2] : 0, id ? id[3] : 0, id ? id[4] : 0, id ? id[5] : 0,
+                       id ? id[6] : 0, id ? id[7] : 0, trace_groups[0], trace_groups[1], trace_groups[2], c3[0], c3[1], c3[2], c3[3]);
+            }
+        }
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
             // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
@@ -1414,6 +1463,33 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
     return t;
 }
 
+// A colour image under a compare sampler whose storage a depth image of the same bits rendered (vk_texture_depth_partner)
+// is sampled through that depth image: Vulkan compares depth formats only. TOTK_DEPTH_PARTNER=0: off.
+static int partner_swap(VkExec *ex, const GfxShaderRes *r, uint64_t h, VkDescriptorImageInfo *out) {
+    static int on = -1;
+    static unsigned n_swap, n_miss;
+    if (on < 0) on = rt_knob("DEPTH_PARTNER", "1");
+    if (!on) return 0;
+    view_t tv;
+    int thv = 0;
+    const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &tv, &thv);
+    if (!img || (img->format != VK_FORMAT_R16_UNORM && img->format != VK_FORMAT_R32_SFLOAT)) return 0;
+    const VkTexImage *d = vk_texture_depth_partner(img);
+    VkImageView v = d ? get_view(ex, d, &tv, thv, r->type, 0) : VK_NULL_HANDLE;
+    if (!v) {
+        if (n_miss++ < 4)
+            rt_log("vk_exec: %ux%u %s at %#llx under a compare sampler has no depth image at its address: sampled as colour",
+                   img->width, img->height, img->format == VK_FORMAT_R16_UNORM ? "R16_UNORM" : "R32_SFLOAT",
+                   (unsigned long long)img->addr);
+        return 0;
+    }
+    if (n_swap++ < 4)
+        rt_log("vk_exec: %ux%u %s at %#llx under a compare sampler: sampled through its depth image", img->width,
+               img->height, img->format == VK_FORMAT_R16_UNORM ? "R16_UNORM" : "R32_SFLOAT", (unsigned long long)img->addr);
+    out->imageView = v, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    return 1;
+}
+
 // The image descriptor of slot h; in a dispatch, a compare-sampled colour image the driver cannot compare is swapped
 // for its depth twin; in a pass larger than it, the scene's light target, once DLSS scaled it this frame, for DLSS's
 // output (vk_dlaa.c).
@@ -1422,13 +1498,98 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
     if (h && !storage && vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1 &&
         vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_dlaa_swap_img)
         out->imageView = vk_dlaa_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    if (!twin_dispatch || storage || separate || !h || !(r->type & 0x400)) return;
+    if (storage || separate || !h || !(r->type & 0x400)) return;
+    if (partner_swap(ex, r, h, out) || !twin_dispatch) return;
     VkImageViewType vt = res_view_type(r->type);
     if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
     const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
     Twin *t = img ? twin_update(ex, img) : NULL;
     VkImageView v = t ? t->view[vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY] : VK_NULL_HANDLE;
     if (v) out->imageView = v, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+}
+
+// ---- buffer textures (NVN_TEXTURE_TARGET_BUFFER)
+// MUA3's clustered lighting reads its light lists and light parameters through buffer textures (texelFetch on a
+// samplerBuffer); with the zero view every light was missing and the scene was lit by its ambient term only. The view
+// covers the texture's texels in the pool buffer that backs its storage, made for the submission being recorded and
+// destroyed once it completed; views asked for again in the same submission are reused. An address the device cannot
+// view (minTexelBufferOffsetAlignment) or a format without texel-buffer support keeps the zero view.
+#define TV_N 256
+static struct { VkBuffer buf; VkDeviceSize off, range; VkFormat fmt; uint64_t sub; VkBufferView view; } TV[TV_N];
+
+static void texel_view_free(void *arg) { vkDestroyBufferView(vk_ctx()->device, (VkBufferView)arg, NULL); }
+
+// TOTK_TEXBUF: all (buffer textures of every stage), noimg (default: a dispatch that also binds a storage image keeps
+// the zero view: with real data such a pass of MUA3's stage load faults the GPU, not understood yet), gfx (vertex and
+// fragment stages only), 0 (none).
+static int texbuf_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = cfg_get("TOTK_TEXBUF");
+        m = !e || !*e ? 3 : !strcmp(e, "all") ? 2 : !strcmp(e, "gfx") ? 1 : !strcmp(e, "0") ? 0 : 3;
+        static const char *const what[] = {"zero (TOTK_TEXBUF=0)", "vertex and fragment stages (TOTK_TEXBUF=gfx)",
+                                           "every stage (TOTK_TEXBUF=all)", "every stage but dispatches with storage images (TOTK_TEXBUF)"};
+        rt_log("vk_exec: buffer textures: %s", what[m]);
+    }
+    return m;
+}
+
+static VkBufferView texel_view(VkExec *ex, uint64_t h, int storage, int st, int binds_img) {   // texture lock held
+    (void)ex;
+    int mode = texbuf_mode();
+    if (!mode || (mode == 1 && st == NVN_STAGE_CS) || (mode == 3 && st == NVN_STAGE_CS && binds_img)) return Z.zview;
+    uint64_t addr;
+    int nf;
+    uint32_t n;
+    if (!h || !vk_texture_buffer_locked((int)(h & 0xfffff), &addr, &nf, &n)) return Z.zview;
+    TexVkFormat f;
+    int bw, bh, bpb = nvn_fmt_bpb(nf, &bw, &bh);
+    if (!tex_vk_format(nf, &f) || f.vk != f.ideal || f.expand_rgb || bw != 1 || bh != 1 || !bpb) {
+        warn_once(W_TEXBUF, "buffer texture format %#x has no texel-buffer format here: a zero buffer is bound", nf);
+        return Z.zview;
+    }
+    static VkDeviceSize align, max_texels;
+    static VkFormatFeatureFlags need[2] = {VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT, VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT};
+    if (!align) {
+        VkPhysicalDeviceProperties pr;
+        vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pr);
+        align = pr.limits.minTexelBufferOffsetAlignment ? pr.limits.minTexelBufferOffsetAlignment : 1;
+        max_texels = pr.limits.maxTexelBufferElements;
+    }
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, f.vk, &fp);
+    if (!(fp.bufferFeatures & need[storage != 0])) {
+        warn_once(W_TEXBUF, "buffer texture format %#x (vk %d) cannot be a texel buffer here: a zero buffer is bound", nf, (int)f.vk);
+        return Z.zview;
+    }
+    if (n > max_texels) n = (uint32_t)max_texels;
+    VkMemSpan sp;
+    VkDeviceSize bytes = (VkDeviceSize)n * (uint32_t)bpb;
+    if (!vk_mem_resolve(addr, 1, &sp) || sp.offset % align) {
+        warn_once(W_TEXBUF, "buffer texture at %#llx is not backed or not aligned: a zero buffer is bound", (unsigned long long)addr);
+        return Z.zview;
+    }
+    if (bytes > sp.avail) bytes = sp.avail / (uint32_t)bpb * (uint32_t)bpb;
+    if (!bytes) return Z.zview;
+    VK_MEM_USE(sp);
+    if (storage) vk_mem_gpu_wrote(&sp, bytes), vk_usnap_drop(addr, bytes);
+    VK_MEM_BOUND(sp);
+    uint64_t sub = vk_sync_issued() + 1;
+    unsigned i = (unsigned)(((uint64_t)(uintptr_t)sp.buffer ^ sp.offset * 0x9E3779B97F4A7C15ull ^ (uint64_t)f.vk) % TV_N);
+    if (TV[i].view && TV[i].sub == sub && TV[i].buf == sp.buffer && TV[i].off == sp.offset && TV[i].range == bytes &&
+        TV[i].fmt == f.vk)
+        return TV[i].view;
+    VkBufferViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = sp.buffer, .format = f.vk,
+                                 .offset = sp.offset, .range = bytes};
+    VkBufferView v;
+    if (vkCreateBufferView(vk_ctx()->device, &ci, NULL, &v) != VK_SUCCESS) return Z.zview;
+    vk_completion_add(sub, texel_view_free, (void *)v);
+    TV[i] = (typeof(TV[0])){sp.buffer, sp.offset, bytes, f.vk, sub, v};
+    static int logged;
+    if (logged++ < 4)
+        rt_log("vk_exec: buffer texture at %#llx: %u texels of format %#x as a %s texel buffer", (unsigned long long)addr, n,
+               nf, storage ? "storage" : "uniform");
+    return v;
 }
 
 static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
@@ -1660,6 +1821,8 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
+                    else if (!img && slot >= GFX_TEX_AT_IMG && slot < GFX_TEX_AT_IMG + 32)
+                        rs_add(tmp, &n, ex, &ex->img[st][slot - GFX_TEX_AT_IMG], 8);
                 }
             }
         }
@@ -1768,6 +1931,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (skip == 2) memcpy(RS.pcnt, RS.cnt, sizeof RS.cnt), RS.pncnt = RS.ncnt;
         RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
     }
+    int binds_img = 0;   // a storage image among the bindings (texel_view, TOTK_TEXBUF)
+    for (uint32_t i = 0; i < info->n_bindings && !binds_img; i++)
+        binds_img = info->bindings[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     uint32_t n_sets = info->n_sets ? info->n_sets : 1;
     uint32_t lo[2] = {0, 0}, hi[2] = {0, 0}, d0[2] = {0, 0};   // bindings [lo, hi) and first descriptor per set
     int need_w = 0;                                             // a set without a template: fill the write structs
@@ -1810,11 +1976,16 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 kind = 2;
-                for (uint32_t k = 0; k < cnt; k++) {   // buffer textures are not replayed yet
+                vk_texture_lock();
+                for (uint32_t k = 0; k < cnt; k++) {
+                    int slot = r->slot + (int)k;
+                    uint64_t h = img ? (slot >= 0 && slot < 32 ? ex->img[st][slot] : 0) : tex_handle(ex, st, slot);
+                    VkBufferView view = texel_view(ex, h, img, st, binds_img);
                     o[k].w[0] = 0, o[k].w[1] = 0, o[k].w[2] = 0;
-                    o[k].view = Z.zview;
-                    if (need_w) bv[nd + k] = Z.zview;
+                    o[k].view = view;
+                    if (need_w) bv[nd + k] = view;
                 }
+                vk_texture_unlock();
             } else {
                 kind = 1;
                 vk_texture_lock();   // tex_info looks up with the texture lock held
@@ -1822,7 +1993,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
-                    else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    else h = tex_handle(ex, st, slot);
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
@@ -1946,7 +2117,11 @@ static VkViewport draw_viewport(VkExec *ex) {
     }
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
+    // Upper-left window origin (TotK, MUA3): NDC +y at row 0 as NVN puts it, by a negative height. Lower-left origin
+    // (NVN's default, as GL; Cadence of Hyrule): NDC -y at row 0, Vulkan's own mapping, so every target holds rows
+    // as the Switch does and a shader that samples one with GL texture coordinates (shadow maps) reads the right row.
+    VkViewport v = nvn_origin_lower_left() ? (VkViewport){x, y, w, h, ex->depth_range[0], ex->depth_range[1]}
+                                           : (VkViewport){x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};
     vk_dlaa_viewport(ex, &v);   // the scene's draws move by the DLAA jitter
     return v;
 }
@@ -2107,9 +2282,12 @@ static int pipe_memo_on(void) {
     return PM.on;
 }
 
+// A draw prepare_draw drops: counted per pass in a frame dump (vk_dump_dropped). Returns 0 for the callers.
+#define DROP(why) (vk_dump_armed ? vk_dump_dropped(why) : (void)0, 0)
+
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
-    if (ex->render_disabled) return 0;
+    if (ex->render_disabled) return DROP(VK_DROP_DISABLED);
     cb_res(ex);
     dummies_init();
     if (ex->pass_noatt) {   // no attachment: the pass covers this draw's viewport or scissor, reopened when it needs more
@@ -2121,8 +2299,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     vk_exec_pass_begin(ex);
     VkRect2D sc = vk_exec_scissor(ex);
-    if (!sc.extent.width || !sc.extent.height) return 0;
-    if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
+    if (!sc.extent.width || !sc.extent.height) return DROP(VK_DROP_SCISSOR);
+    if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), DROP(VK_DROP_NOPROG);
     int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = shader_memo_on();
     const GfxShader *vs, *fs;
     uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
@@ -2141,26 +2319,26 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (memo && vs && !vs_wait && !fs_wait && (!has_fs || fs))
             memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.has_fs = has_fs, SM.valid = 1;
     }
-    if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
+    if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), DROP(VK_DROP_NOVS);
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), DROP(VK_DROP_SHADER_PENDING);   // skipped until ready
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
-    if (!vs || (has_fs && !fs)) return 0;
-    if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
+    if (!vs || (has_fs && !fs)) return DROP(VK_DROP_SHADER_FAILED);
+    if (vk_dlaa_skip_draw(ex, fs)) return DROP(VK_DROP_DLAA);   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
-    s.y_flip = 1;
+    s.y_flip = (uint8_t)!nvn_origin_lower_left();   // draw_viewport's negative height
     s.prim_restart = (uint8_t)(restart != 0);
     const VkPipeInfo *info = NULL;
     int pending;
@@ -2216,8 +2394,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
                pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
     }
-    if (pending) return 0;   // a background worker is building it: the draw is skipped until it is ready
-    if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    if (pending) return DROP(VK_DROP_PIPE_PENDING);   // a background worker is building it: the draw is skipped until it is ready
+    if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), DROP(VK_DROP_PIPE_FAILED);
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);
@@ -2233,6 +2411,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
+    if (!ex->pass_stores && (shader_stores(vs) || shader_stores(fs))) ex->pass_stores = 1;
     bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
@@ -2419,7 +2598,7 @@ static int mo_desc(VkExec *ex, const VkPipeInfo *info, MoDraw *q) {
             vk_texture_lock();
             for (uint32_t k = 0; k < cnt; k++) {
                 int slot = r->slot + (int)k;
-                tex_info(ex, r, slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0, 0, r->separate, &o[k].image);
+                tex_info(ex, r, tex_handle(ex, st, slot), 0, r->separate, &o[k].image);
             }
             vk_texture_unlock();
         } else {
@@ -3032,6 +3211,12 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
     }
     ex->recorded++;
+    if (vk_dump_armed) {
+        char what[128];
+        snprintf(what, sizeof what, "DrawArrays prim %d first %u count %u instances %u base instance %d", d->prim, first, n,
+                 inst, (int)d->base_instance);
+        vk_dump_draw_done(ex, what, 0, 0, 0, 0);
+    }
 }
 
 // Primitive restart of an indexed draw. NVN restarts strips wherever an index equals the SetPrimitiveRestart value;
@@ -3088,6 +3273,13 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
                      (uint32_t)d->base_instance);
     ex->recorded++;
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
+    if (vk_dump_armed) {
+        char what[160];
+        snprintf(what, sizeof what, "DrawElements prim %d count %d index size %u instances %d base vertex %d base instance "
+                 "%d restart %d", d->prim, d->count, isize[d->itype], d->instances, d->base_vertex, (int)d->base_instance,
+                 restart);
+        vk_dump_draw_done(ex, what, d->ibuf, bytes, 0, 0);
+    }
 }
 
 // DrawElementsIndirect: the arguments are read by the GPU from the pool buffer (they are often written by an earlier
@@ -3106,6 +3298,12 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
         ex->recorded++;
         vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndirectCommand));
         VK_MEM_BOUND(ip);
+        if (vk_dump_armed) {
+            char what[96];
+            snprintf(what, sizeof what, "DrawArraysIndirect prim %d (arguments: count, instances, first, base instance)",
+                     d->prim);
+            vk_dump_draw_done(ex, what, 0, 0, d->ind, sizeof(VkDrawIndirectCommand));
+        }
         return;
     }
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_SHORT && d->itype != NVN_INDEX_TYPE_UNSIGNED_INT)
@@ -3125,6 +3323,12 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
     VK_MEM_BOUND(ip);
     VK_MEM_BOUND(ib);
+    if (vk_dump_armed) {   // the index count lives in the arguments: the index buffer is copied up to the cap
+        char what[160];
+        snprintf(what, sizeof what, "DrawElementsIndirect prim %d index size %d (arguments: count, instances, first "
+                 "index, base vertex, base instance)", d->prim, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4);
+        vk_dump_draw_done(ex, what, d->ibuf, ib.avail, d->ind, sizeof(VkDrawIndexedIndirectCommand));
+    }
 }
 
 // ---- dispatch and uniform buffer updates
@@ -3145,7 +3349,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
     twin_dispatch = 1;
+    trace_cs = cs, trace_groups[0] = (uint32_t)d->x, trace_groups[1] = (uint32_t)d->y, trace_groups[2] = (uint32_t)d->z;
     bind_resources(ex, info);
+    trace_cs = NULL;
     twin_dispatch = 0;
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
@@ -3195,6 +3401,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (!u->size) return;
+    vk_exec_frame.ub_updates++;
     VkMemSpan sp;
     if (!vk_mem_resolve(u->dst, u->size, &sp)) return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
     cb_res(ex);
@@ -3226,11 +3433,26 @@ static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b) {
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     switch (op) {
     case OP_BIND_PROGRAM: {
+        // NVN binds per stage (NVNshaderStageBits: bit st for NVN stage st): the stages in the mask take this program,
+        // the others keep theirs, and a NULL program unbinds just the stages in the mask (a depth-only draw unbinds
+        // the fragment stage). prog stays on a program still bound: a NULL prog dropped every draw up to the next
+        // bind. Same fix as Astral Chain Recomp 813d115 (MIT).
         const p_bind_program *b = payload;
-        ex->prog = b->prog, ex->prog_stages = b->stages;
-        // NVNshaderStageBits: bit st for NVN stage st. A null program unbinds the stages of the mask.
+        ex->prog_stages = b->stages;
+        uint32_t mask = (uint32_t)b->stages;
+        if (!mask || mask == NVN_SHADER_STAGE_BITS_LARGE) mask = 0x3f;
         for (int st = 0; st < 6; st++)
-            if (b->stages & (1 << st)) ex->stage_prog[st] = b->prog;
+            if (mask & (1u << st)) ex->stage_prog[st] = b->prog;
+        if (b->prog) ex->prog = b->prog, ex->prog_unbound &= ~mask;
+        else {
+            static int said;
+            if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+                rt_log("vk_exec: first BindProgram(NULL, %#x): only those stages are unbound", mask);
+            ex->prog_unbound |= mask;
+            ex->prog = NULL;
+            for (int st = 0; st < 6; st++)   // the vertex stage first: a draw's shaders come from it
+                if (ex->stage_prog[st] && !(ex->prog_unbound & (1u << st))) { ex->prog = ex->stage_prog[st]; break; }
+        }
         bind_gen++;
         break;
     }
@@ -3248,6 +3470,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
         case 4: memcpy(&ex->pipe.poly, b->bytes, sizeof ex->pipe.poly); break;
         case 5: memcpy(&ex->pipe.ds, b->bytes, sizeof ex->pipe.ds); break;
         case 6: memcpy(&ex->point_size, b->bytes, sizeof ex->point_size); break;
+        case 7: memcpy(&ex->pipe.alpha_ref, b->bytes, sizeof ex->pipe.alpha_ref); break;
         }
         break;
     }

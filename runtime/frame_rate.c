@@ -186,7 +186,7 @@ static uint64_t read_ptr(uint64_t a) {
 // read it, and one of them reproduces this walk (the 14-component check, component 13, the 0x70 stride and the name
 // compare) instruction for instruction.
 static int player_pos(float xyz[3]) {
-    if (RT_MUA3) return 0;   // the pointer chain below is TotK's main
+    if (RT_OTHER_GAME) return 0;   // the pointer chain below is TotK's main
     uint64_t module = read_ptr(MOD_MAIN_BASE + (RT_V143 ? 0x3add238 : RT_V110 ? 0x4630a68 : 0x4728538)),
              scene = module ? read_ptr(module + 0x1e8) : 0;
     int32_t count = 0;
@@ -255,7 +255,7 @@ static void world_clock(double dt, double step) {
     if (w < 0) {
         float p[3] = {0, 0, 0};
         // MUA3 has no known player position: its world clock starts at the first present.
-        if (!RT_MUA3 && (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f)) return;   // a few guest reads, until
+        if (RT_TOTK && (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f)) return;   // a few guest reads, until
                                                                                           // the load ends
         rt_log("frame step: world clock starts at present %llu, %.2f s after the guest started (the player at %.1f %.1f %.1f)",
                (unsigned long long)presents, rt_guest_start_ns ? (kern_now_ns() - rt_guest_start_ns) / 1e9 : 0.0, p[0],

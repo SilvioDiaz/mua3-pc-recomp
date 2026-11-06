@@ -36,6 +36,7 @@
 #include "host.h"
 #include "input_map.h"
 #include "mods.h"
+#include "movie.h"
 #include "romfs_config.h"
 #include "romfs_path.h"
 #include "platform/platform.h"
@@ -1029,6 +1030,8 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     if (!p) return FS_R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
+    size_t plen = strlen(p);
+    if (plen > 4 && !strcasecmp(p + plen - 4, ".mp4")) movie_note_open(path);
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {

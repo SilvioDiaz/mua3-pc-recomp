@@ -45,7 +45,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
     [UI_MENU_SAVE_FAILED] = "could not save settings",
-    [UI_MENU_VERSION] = "TotK Recomp %s, game %s",
+    [UI_MENU_VERSION] = "%s %s, game %s",
 
     [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Fills the screen with the game; F11 toggles it.",
     [UI_MENU_WINDOW_SIZE] = "Window size", [UI_MENU_WINDOW_SIZE_DESC] = "Size of the game window when not fullscreen.",
@@ -497,7 +497,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DEFAULT_MARK] = "по умолчанию",
     [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
-    [UI_MENU_VERSION] = "TotK Recomp %s, игра %s",
+    [UI_MENU_VERSION] = "%s %s, игра %s",
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
     [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна игры вне полноэкранного режима.",
@@ -984,7 +984,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_DEFAULT_MARK] = "padrão",
     [UI_MENU_AFTER_RESTART] = "após reiniciar", [UI_MENU_SET_BY_ENV] = "definido por variável de ambiente",
     [UI_MENU_SAVE_FAILED] = "não foi possível salvar as configurações",
-    [UI_MENU_VERSION] = "TotK Recomp %s, jogo %s",
+    [UI_MENU_VERSION] = "%s %s, jogo %s",
 
     [UI_MENU_FULLSCREEN] = "Tela cheia", [UI_MENU_FULLSCREEN_DESC] = "O jogo ocupa a tela inteira; F11 alterna.",
     [UI_MENU_WINDOW_SIZE] = "Tamanho da janela",
@@ -1471,7 +1471,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_AFTER_RESTART] = "重启后生效",
     [UI_MENU_SET_BY_ENV] = "由环境变量设定",
     [UI_MENU_SAVE_FAILED] = "无法保存设置",
-    [UI_MENU_VERSION] = "TotK Recomp %s，游戏 %s",
+    [UI_MENU_VERSION] = "%s %s，游戏 %s",
     [UI_MENU_FULLSCREEN] = "全屏",
     [UI_MENU_FULLSCREEN_DESC] = "游戏铺满屏幕；按 F11 切换。",
     [UI_MENU_WINDOW_SIZE] = "窗口大小",

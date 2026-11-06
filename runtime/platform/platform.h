@@ -214,6 +214,11 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
+// Debugging aid (TOTK_WATCH, nvn_api_cmd.c watch_parse): makes the committed pages of [addr, addr + n) read-only and
+// reports every write into them to fn (the address written and the writing instruction as an offset in this
+// executable, 0 outside it), then lets the write run and makes the page read-only again after it. Up to 32 ranges;
+// 1 on success. Windows only (0 elsewhere).
+int plat_mem_watch(uint64_t addr, uint64_t n, void (*fn)(uint64_t addr, uint64_t exe_off));
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -703,6 +704,15 @@ NVN_API(nvnCommandBufferSetPointSize) {
     r->kind = 6;
     memcpy(r->bytes, &s, sizeof s);
 }
+// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): the alpha test's reference, recorded as bind-state
+// kind 7 with the float as payload; the replay passes it with the colour state's alpha function to the fragment
+// shader's translation (vk_pipeline_answers). From Astral Chain Recomp 78c4828 (MIT).
+NVN_API(nvnCommandBufferSetAlphaRef) {
+    p_bind_state *r = REC(cmd_of(c), OP_BIND_STATE, p_bind_state);
+    float ref = arg_s(c, 0);
+    r->kind = 7;
+    memcpy(r->bytes, &ref, sizeof ref);
+}
 // void nvnCommandBufferBindVertexAttribState(NVNcommandBuffer *cmd, int n, const NVNvertexAttribState *states)
 NVN_API(nvnCommandBufferBindVertexAttribState) {
     cmd_t *o = cmd_of(c);
@@ -858,17 +868,74 @@ NVN_API(nvnCommandBufferDrawElementsInstanced) {
                                                     (int)arg_x(c, 5), (int)arg_x(c, 6), (int)arg_x(c, 7), arg_x(c, 4)};
     hw_fix(o, 44);
 }
+// ---- write watch (debugging aid): which code writes the arguments and indices of indirect draws. MUA3's G-buffer draws
+// read count 0 from arguments nothing in the frame was seen writing (docs/mua3-port.md, round 10).
+// TOTK_WATCH=<hex addr>:<hex len>[,...] watches those guest ranges from the first indirect draw on.
+// TOTK_WATCH_IND=<n> watches the 48 bytes of arguments and the first 4 KiB of indices of the first n indirect draws
+// with distinct argument addresses (CPU-visible pools only). Each writing instruction is logged once with the first
+// address it wrote; `addr2line -f -e mua3.exe 0x<image base + offset>` names the recompiled function f_<guest address>.
+static void watch_report(uint64_t addr, uint64_t off) {
+    static volatile uint64_t seen[512];
+    static volatile int32_t nseen;
+    int32_t n = __atomic_load_n(&nseen, __ATOMIC_ACQUIRE);
+    for (int32_t i = 0; i < n && i < 512; i++)
+        if (seen[i] == off) return;
+    int32_t k = plat_inc32(&nseen) - 1;
+    if (k < 512) seen[k] = off;
+    if (k < 512) rt_log("watch: write to %#llx by exe+%#llx", (unsigned long long)addr, (unsigned long long)off);
+}
+
+static void watch_range(uint64_t a, uint64_t n, const char *why) {
+    if (nvn_gpu_only(a)) return;   // a CPU-invisible pool: no host pages
+    mem_thaw(a, n);                // a frozen region thawed later would make the pages writable again
+    int ok = plat_mem_watch(a, n, watch_report);
+    rt_log("watch: %s %#llx+%#llx%s", why, (unsigned long long)a, (unsigned long long)n, ok ? "" : " (refused)");
+}
+
+static void watch_indirect(uint64_t indices, uint64_t indirect) {
+    static int env_done, want = -1, have;
+    static uint64_t args[32];
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    if (want == 0) return;
+    plat_mutex_lock(&lock);
+    if (want < 0) {
+        const char *e = cfg_get("TOTK_WATCH_IND");
+        want = e ? atoi(e) : 0;
+        if (want > 15) want = 15;   // two ranges a draw, 32 ranges in all
+    }
+    if (!env_done) {
+        env_done = 1;
+        const char *e = cfg_get("TOTK_WATCH");
+        for (const char *p = e; p && *p;) {
+            char *q;
+            uint64_t a = strtoull(p, &q, 16), n = *q == ':' ? strtoull(q + 1, &q, 16) : 0;
+            if (n) watch_range(a, n, "range");
+            p = *q == ',' ? q + 1 : NULL;
+        }
+    }
+    int seen = 0;
+    for (int i = 0; i < have; i++) seen |= args[i] == indirect;
+    if (!seen && have < want) {
+        args[have++] = indirect;
+        watch_range(indirect, 48, "indirect arguments");
+        if (indices) watch_range(indices, 4096, "indirect indices");
+    }
+    plat_mutex_unlock(&lock);
+}
+
 // void nvnCommandBufferDrawElementsIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNindexType type,
 // NVNbufferAddress indices, NVNbufferAddress indirect): the arguments at indirect are often GPU-written, so the replay
 // draws with vkCmdDrawIndexedIndirect from the pool buffer (nxnative hle_nvn.c, SavageWindRecomp cmdbuf.c)
 NVN_API(nvnCommandBufferDrawElementsIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
+    watch_indirect(arg_x(c, 3), arg_x(c, 4));
 }
 // void nvnCommandBufferDrawArraysIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNbufferAddress indirect):
 // the same op without indices (index type -1); the replay draws with vkCmdDrawIndirect, whose argument layout
 // (count, instances, first vertex, base instance) is NVN's.
 NVN_API(nvnCommandBufferDrawArraysIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), -1, 0, arg_x(c, 2)};
+    watch_indirect(0, arg_x(c, 2));
 }
 // void nvnCommandBufferDispatchCompute(NVNcommandBuffer *cmd, int x, int y, int z): caller = the game's return address
 NVN_API(nvnCommandBufferDispatchCompute) {

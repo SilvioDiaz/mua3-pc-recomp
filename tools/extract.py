@@ -33,9 +33,13 @@ from extract_exefs import (common_tickets, container_entries, load_keys, nca_inv
                            record_offset, require)
 from extract_romfs import index_romfs  # noqa: E402
 from extract_update_romfs import copy_range, hactool_prod_keys  # noqa: E402
+sys.path.insert(0, str(ROOT / 'tools'))
+from game_profile import GAME  # noqa: E402
+import vendor_titles  # noqa: E402
+program_nca = vendor_titles.program_nca   # the profile's title ids (tools/game_profile.py)
 
-DATA = ROOT / 'tools' / 'data'
-EXEFS_CODE = ('main', 'sdk', 'subsdk0', 'rtld')
+DATA = GAME['data']
+EXEFS_CODE = ('main', 'sdk', 'subsdk0', 'rtld')   # every expected module but main.npdm is checked (exefs_problems)
 LONG_HEX = re.compile(r'[0-9A-Fa-f]{32,}')
 # hactool checks two signatures with Nintendo public keys it does not ship, so these two lines always read (FAIL) and
 # say nothing about the data. The IVFC levels and the image hash decide.
@@ -87,8 +91,9 @@ def version_dir(expected):
 
 # The embeddable Python (a ._pth file) does not put a script's directory on sys.path, so a vendored script that imports
 # its siblings fails when started by path. This stub adds the directory, then runs the script as __main__.
-RUN_SCRIPT = ('import os, runpy, sys; p = sys.argv[1]; sys.path.insert(0, os.path.dirname(p)); sys.argv = sys.argv[1:]; '
-              "runpy.run_path(p, run_name='__main__')")
+# tools/vendor_titles.py runs it with program_nca taking the profile's title ids (tools/game_profile.py).
+RUN_SCRIPT = ('import os, sys; p = sys.argv[1]; t = os.path.dirname(os.path.dirname(os.path.dirname(p))); '
+              'sys.path.insert(0, t); import vendor_titles; vendor_titles.run(p, sys.argv[2:])')
 
 
 def run_logged(command, log, source=None):
@@ -109,7 +114,7 @@ def run_logged(command, log, source=None):
 def exefs_problems(exefs, expected):
     """Code modules must match byte for byte. main.npdm differs between dumps that a repacking tool re-signed."""
     problems = []
-    for name in EXEFS_CODE:
+    for name in [n for n in expected['exefs_sha256'] if n != 'main.npdm']:   # main, sdk, subsdk0..9, rtld
         path = exefs / name
         if not path.is_file() or sha256(path) != expected['exefs_sha256'][name]:
             problems.append(name)
@@ -224,15 +229,16 @@ def damaged_merge_input(hactool, hactool_keys, environment, base, update, base_n
 def merge_update_romfs(base, update, keys_path, hactool, output, logs, phase=lambda name: say(MERGE_PHASES[name])):
     """extract_update_romfs.merge() without its Darwin-only bounded view of the base: the base Program NCA is copied out.
 
-    Needs room for both Program NCAs (about 17 GB together) and the merged image (about 17 GB). phase(name) is called
-    as each part of MERGE_PHASES starts.
+    Needs room for both Program NCAs (TotK: about 17 GB together) and the merged image, which is at most as large as the
+    two together (TotK: about 17 GB). phase(name) is called as each part of MERGE_PHASES starts.
     """
     if output.exists():
         shutil.rmtree(output)
     tickets, inputs = program_ncas(base, update, keys_path)
     sections = [i for i in range(4) if inputs[1][2][0x400 + i * 512 + 4] == 4]
     require(len(sections) == 1, 'Expected one BKTR section')
-    need = inputs[0][1]['size'] + inputs[1][1]['size'] + 18 * (1 << 30)
+    ncas = inputs[0][1]['size'] + inputs[1][1]['size']
+    need = 2 * ncas + (1 << 30)   # the copies, the merged image and 1 GiB to spare
     require(shutil.disk_usage(output.parent).free > need, f'Need {need / (1 << 30):.0f} GiB free in {output.parent}')
     log_path = logs / f'merge_romfs-{output.parent.name}.log'
     with tempfile.TemporaryDirectory(prefix='update-merge-', dir=output.parent) as tmp:
@@ -297,7 +303,7 @@ def main():
     extracted, logs = work / 'extracted', work / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     versions = load_expected()
-    v0 = versions['1.0.0']
+    v0 = versions[GAME['base_version']]
 
     say('Base game')
     base_out = extracted / 'v0'
@@ -305,11 +311,11 @@ def main():
         say('  extracting ExeFS')
         extract_exefs(base, keys, base_out, logs, update=False)
     problems = exefs_problems(base_out / 'exefs', v0)
-    require(not problems, f'Base game is not TotK 1.0.0: {", ".join(problems)} differ')
-    say('  ExeFS 1.0.0: main, sdk, subsdk0, rtld match')
+    require(not problems, f'Base game is not {GAME["name"]} {GAME["base_version"]}: {", ".join(problems)} differ')
+    say(f'  ExeFS {GAME["base_version"]}: code modules match')
     report_npdm(base_out / 'exefs', v0)
     if not romfs_verified(base_out / 'romfs', v0):
-        say('  extracting RomFS (17 GB)')
+        say('  extracting RomFS')
         extract_base_romfs(base_out, keys, logs, base)
     check_romfs(base_out / 'romfs', v0)
 

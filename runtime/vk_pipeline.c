@@ -558,6 +558,16 @@ void vk_pipeline_answers(const VkPipeState *s, GfxShaderAnswers *vs, GfxShaderAn
             VkFormat f = target_format(s->color_fmt[i], NULL, NULL);
             fs->frag_out_type[i] = (uint8_t)(f == VK_FORMAT_UNDEFINED ? GFX_TYPE_FLOAT : format_type(f));
         }
+    if (fs) {
+        // Maxwell's fixed-function alpha test (NVN ColorState SetAlphaTest + SetAlphaRef) has no Vulkan equivalent: the
+        // translator discards in the shader, as Ryujinx does (EmitterContext.FinalizeReturn). ALWAYS is the default and
+        // leaves the shader as it is; the reference only matters with a comparing function.
+        unsigned af = s->color.alpha_func;
+        if (af >= NVN_ALPHA_FUNC_NEVER && af < NVN_ALPHA_FUNC_ALWAYS) {
+            fs->alpha_func = (uint8_t)af;
+            fs->alpha_ref = af == NVN_ALPHA_FUNC_NEVER ? 0.0f : s->alpha_ref;
+        }
+    }
 }
 
 // ---- vertex input (pipeline state, or vkCmdSetVertexInputEXT)
@@ -1908,6 +1918,7 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     r->s = *s;
     r->s.vs = r->s.fs = NULL;
     r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
+    r->s.alpha_ref = 0;      // part of the fragment shader's input id already
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
@@ -3119,15 +3130,25 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     const ds_st *d = &s->ds;
     // The front face maps unchanged: TOTK sets the upper-left window origin, and the y-flipped viewport (y_flip) puts
     // NDC +y at row 0 as NVN does, so the framebuffer winding Vulkan tests is the one NVN tests (MacNativeGames passes
-    // it to Metal unchanged; LAS Recomp exec.c mirrors it only for the lower-left origin).
-    int front_cw = pl->front == NVN_FRONT_FACE_CW;
+    // it to Metal unchanged; LAS Recomp exec.c mirrors it only for the lower-left origin). With the lower-left origin
+    // (y_flip 0, a positive-height viewport) the rows run the other way, so the winding is mirrored as there.
+    int front_cw = (pl->front == NVN_FRONT_FACE_CW) == (s->y_flip != 0);
     vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
     vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
-    vkCmdSetDepthTestEnable(cb, d->dt);
+    // TOTK_DEBUG_DS (debug): 1 turns the stencil test off, 2 the depth test off, 3 both, to see whether a pass that writes
+    // nothing loses its fragments to those tests.
+    static int dbg_ds = -1;
+    if (dbg_ds < 0) {
+        const char *e = cfg_get("TOTK_DEBUG_DS");
+        dbg_ds = e && *e ? atoi(e) : 0;
+        if (dbg_ds) rt_log("vk_pipeline: TOTK_DEBUG_DS=%d: %s%s test off (debug)", dbg_ds, dbg_ds & 1 ? "stencil " : "",
+                           dbg_ds & 2 ? "depth " : "");
+    }
+    vkCmdSetDepthTestEnable(cb, d->dt && !(dbg_ds & 2));
     vkCmdSetDepthWriteEnable(cb, d->dw);
     vkCmdSetDepthCompareOp(cb, compare_op(d->df));
-    vkCmdSetStencilTestEnable(cb, d->st);
+    vkCmdSetStencilTestEnable(cb, d->st && !(dbg_ds & 1));
     vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
                       compare_op(d->sf_f));
     vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, stencil_op(d->fail_b), stencil_op(d->zpass_b), stencil_op(d->zfail_b),

@@ -1498,6 +1498,28 @@ uint64_t kern_threads_created(void) {
     return n;
 }
 
+// F9 in the game window (gfx_window_win.c): every guest thread's wait and guest frame-pointer chain to the log, for
+// finding what a stuck game waits on. A blocked thread's context is current; a running thread's is its last saved one.
+void kern_dump_threads(void) {
+    static const char *const wname[] = {"running", "lock", "condvar", "address", "sync"};
+    char d[160];
+    lock();
+    rt_logf("kernel: thread dump (F9)%c", 10);
+    for (RtThread *t = g_all; t; t = t->all) {
+        if (!t->started || t->exited) continue;
+        Cpu *c = t->cur ? t->cur : t->cpu;
+        rt_logf("thread %#x prio %d core %d%s: %s on %#llx (addr %#llx key %#llx), last svc %#x, entry %s%c", t->handle,
+                t->prio, t->cur_core, t->is_main ? " main" : "", t->wkind >= 0 && t->wkind <= 4 ? wname[t->wkind] : "?",
+                (unsigned long long)t->wobj, (unsigned long long)t->waddr, (unsigned long long)t->wkey, t->dg_svc,
+                ldr_describe(t->entry, d, sizeof d), 10);
+        if (c) {
+            rt_logf("  pc %s%c", ldr_describe(c->pc, d, sizeof d), 10);
+            kern_backtrace(c);
+        }
+    }
+    unlock();
+}
+
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
 uint32_t kern_main_thread(Cpu **cpu) {

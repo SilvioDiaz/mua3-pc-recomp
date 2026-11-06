@@ -1,0 +1,18 @@
+{
+  "_comment": "Verified Marvel Ultimate Alliance 3 1.0.0 outputs. Hashes only; no game data.",
+  "title_id": "010060700AC50000",
+  "version": 0,
+  "display_version": "1.0.0",
+  "exefs_sha256": {
+    "main": "b96db3188695c5041a0147765bfa7daa45236ae2c388332fd18b11e61d9b44fb",
+    "main.npdm": "82787ec8fd29be90cf0dcca9e78eecfe8cdc41e8a2e98ae05f2c4521b971e464",
+    "rtld": "52735462296339700ae8c54b3d84f8fd0d96113a313a15a4e0a6973ec63dffb4",
+    "sdk": "d3e7f5dd35e0aa618abddeb1b9f05b38c5a94e4788374b4444c32df057fb0f42",
+    "subsdk0": "1c3ab141bdde9f46cf5a6cefeae07d06d205114e1b16069211067f00fea382b3",
+    "subsdk1": "7505e7c1e0a11d2cfc7daa39f0aa4c51632ee2998baaf5d48b9d711d8d729026"
+  },
+  "romfs": {
+    "size": 14174939948,
+    "sha256": "6d3b11bd3472937f786c16d2e116e8416f6289dc35fe5db886ced098b4caff9b"
+  }
+}

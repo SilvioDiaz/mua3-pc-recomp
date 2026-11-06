@@ -102,6 +102,38 @@ static void counter_cb(void *arg) {
     free(addr);
 }
 
+// Addresses the replay has written a counter report or a ReportValue to (an insert-only set). A render condition whose
+// two words were never written this way holds data the replay does not produce: MUA3 gates every object of its
+// G-buffer pass on 48-byte records ({0, 1, 0, 0} twice) that no report, fill, copy or dispatch of the replay touches,
+// so evaluating them on the CPU skipped every object (black silhouettes). Such a condition renders, as LAS Recomp and
+// MHGU Recomp do for every condition; one on reported words (TotK's timestamp-gated clears) is still evaluated.
+#define REPORTED_N 16384
+static uint64_t reported[REPORTED_N];   // 0: empty slot; replay thread only
+
+static void reported_add(uint64_t addr) {
+    if (!addr) return;
+    uint64_t h = (addr >> 2) * 0x9e3779b97f4a7c15ull;
+    for (unsigned i = 0; i < REPORTED_N; i++) {
+        uint64_t *s = &reported[(h + i) % REPORTED_N];
+        if (*s == addr) break;
+        if (!*s) {
+            *s = addr;
+            break;
+        }
+    }
+}
+
+static int reported_has(uint64_t addr) {
+    uint64_t h = (addr >> 2) * 0x9e3779b97f4a7c15ull;
+    int found = 0;
+    for (unsigned i = 0; i < REPORTED_N; i++) {
+        uint64_t s = reported[(h + i) % REPORTED_N];
+        if (s == addr) { found = 1; break; }
+        if (!s) break;
+    }
+    return found;
+}
+
 // Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
 // and a samples-passed one as unknown.
 #define PENDING 256
@@ -290,6 +322,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         vk_completion_add(ex->fence, counter_cb, a);
     }
     pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
+    reported_add(p->addr);
 }
 
 // ---- conditional rendering
@@ -309,6 +342,13 @@ static int counter_word(uint64_t addr, uint64_t *v) {
 }
 
 static int cond_enabled(const p_render_cond *c) {
+    if (!reported_has(c->addr) && !reported_has(c->addr + 16)) {   // data the replay never wrote (reported above)
+        static int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+            rt_log("vk: render condition at %#llx on words no report wrote: rendering (and for every such condition)",
+                   (unsigned long long)c->addr);
+        return 1;
+    }
     uint64_t x, y;
     int rx = counter_word(c->addr, &x), ry = counter_word(c->addr + 16, &y);
     if (!rx || !ry) {
@@ -522,6 +562,7 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
 // vk_guest_written at the fence, as copies do. Works in CPU-invisible pools.
 
 static void clear_buf(VkExec *ex, const p_clear_buf *p) {
+    if (p->size <= 16) reported_add(p->addr);   // ReportValue (a 4-byte fill) may feed a render condition
     if ((p->addr | p->size) & 3) {
         warn_once(W_BUFFER, "buffer fill at %#llx of %llu bytes is not 4-byte aligned: skipped", (unsigned long long)p->addr,
                   (unsigned long long)p->size);
@@ -606,7 +647,43 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     vk_texture_gpu_written(t);
 }
 
+// While a frame dump is armed: the counter resets, reports and render conditions, with the values a condition read
+// (at most 3000 lines), to see how a game drives its occlusion culling.
+static void trace_cond(VkExec *ex, uint32_t op, const void *payload) {
+    static int lines;
+    if (!vk_dump_armed || lines >= 3000) return;
+    lines++;
+    uint64_t d = vk_exec_frame.draws_seen;
+    if (op == OP_RESET_COUNTER) {
+        rt_log("cond: draw %llu reset type %llu", (unsigned long long)d, (unsigned long long)((const p_reset_counter *)payload)->type);
+    } else if (op == OP_REPORT_COUNTER) {
+        const p_report_counter *p = payload;
+        rt_log("cond: draw %llu report type %llu at %#llx%s", (unsigned long long)d, (unsigned long long)p->type,
+               (unsigned long long)p->addr, nvn_gpu_only(p->addr) ? " (gpu only)" : "");
+    } else if (op == OP_RENDER_COND) {
+        const p_render_cond *c = payload;
+        uint64_t x = 0, y = 0;
+        int rx = counter_word(c->addr, &x), ry = counter_word(c->addr + 16, &y);
+        rt_log("cond: draw %llu cond mode %d at %#llx: %llu (%d) vs %llu (%d) -> %s", (unsigned long long)d, c->mode,
+               (unsigned long long)c->addr, (unsigned long long)x, rx, (unsigned long long)y, ry,
+               cond_enabled(c) ? "render" : "skip");
+        VkMemSpan m;
+        if (!nvn_gpu_only(c->addr) && vk_mem_resolve(c->addr, 48, &m)) {
+            const uint32_t *w = (const uint32_t *)(uintptr_t)c->addr;
+            rt_log("cond:   words %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x", w[0], w[1], w[2], w[3],
+                   w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+        }
+    } else if (op == OP_CLEAR_BUF) {
+        const p_clear_buf *p = payload;
+        rt_log("cond: draw %llu fill %#llx size %llu value %#x", (unsigned long long)d, (unsigned long long)p->addr,
+               (unsigned long long)p->size, p->value);
+    } else if (op == OP_RENDER_ENABLE) {
+        rt_log("cond: draw %llu render enable %d", (unsigned long long)d, ((const p_flag *)payload)->value);
+    }
+}
+
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+    trace_cond(ex, op, payload);
     if (op != OP_RENDER_ENABLE && op != OP_SIGNAL_EVENT) vk_contact_flush(ex);
     switch (op) {
     case OP_COPY_B2B: copy_b2b(ex, payload); break;

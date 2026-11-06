@@ -376,13 +376,16 @@ static void render_thread(void *p) {
             plat_wait_ns(gap_ns - (now - last));
             continue;
         }
+        // The Switch DSP renders one frame per frame_ns: wait for this render's slot instead of rendering in bursts of
+        // the device period (Astral Chain Recomp 0018973, MIT).
         if (pace == 0) {
-            next = now + frame_ns;   // where the timer goes on if the device stops pacing
-        } else {
-            if (next > now) plat_wait_ns(next - now);
-            else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
-            next += frame_ns;
-        }
+            if (now < next) {
+                plat_wait_ns(next - now);
+                continue;
+            }
+        } else if (next > now) plat_wait_ns(next - now);
+        if (now > next && now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
+        next += frame_ns;   // advances at exactly one frame per render; late wakes are absorbed by the next render
         last = kern_now_ns();
         plat_mutex_lock(&r->lock);
         if (r->state == 0) {

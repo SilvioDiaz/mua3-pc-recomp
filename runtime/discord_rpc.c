@@ -170,9 +170,9 @@ static int send_activity(PlatIpc *p, const char *image) {
     snprintf(json, sizeof json,
              "{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%u\",\"args\":{\"pid\":%lu,\"activity\":{\"details\":\"Game "
              "%d.%d.%d \\u00b7 Recomp %.*s\",\"timestamps\":{\"start\":%llu},\"assets\":{\"large_image\":\"%s\","
-             "\"large_text\":\"TotK Recomp %s\"}}}}",
+             "\"large_text\":\"%s %s\"}}}}",
              next_nonce(), (unsigned long)plat_process_id(), v / 100, v / 10 % 10, v % 10, port_len, rt_port_version,
-             (unsigned long long)start, image, rt_port_version);
+             (unsigned long long)start, image, rt_game_name, rt_port_version);
     if (!write_frame(p, OP_FRAME, json)) return 0;
     uint32_t op = 0;
     char answer[ANSWER_CAP];

@@ -1,0 +1,18 @@
+{
+  "_comment": "Verified Marvel Ultimate Alliance 3 4.0.1 outputs from base 1.0.0 plus the cumulative update (title version 524288). Hashes only; no game data.",
+  "title_id": "010060700AC50000",
+  "version": 524288,
+  "display_version": "4.0.1",
+  "exefs_sha256": {
+    "main": "a24b5d2005398b22b885345da626cf342b65099c8775087f8a78dc50031d966f",
+    "main.npdm": "ae585cdb0e43c4328f3df1d210a5ba07952d8fe06c20c54228d6c9c1948fafeb",
+    "rtld": "52735462296339700ae8c54b3d84f8fd0d96113a313a15a4e0a6973ec63dffb4",
+    "sdk": "d3e7f5dd35e0aa618abddeb1b9f05b38c5a94e4788374b4444c32df057fb0f42",
+    "subsdk0": "1c3ab141bdde9f46cf5a6cefeae07d06d205114e1b16069211067f00fea382b3",
+    "subsdk1": "7505e7c1e0a11d2cfc7daa39f0aa4c51632ee2998baaf5d48b9d711d8d729026"
+  },
+  "romfs": {
+    "size": 18437395992,
+    "sha256": "4843403733c4e7478d45ca15a0ad0691cfc315967f625ef8d48d17684a4f3cf8"
+  }
+}

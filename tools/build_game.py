@@ -82,6 +82,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MAIN_ROOT = (ROOT / 'build').resolve().parent
 UCRT = Path(r'C:\msys64\ucrt64\bin')
 EXE = 'totk.exe' if WIN else 'totk'
+# The executable's icon in place of runtime/totk.ico (--icon, else build/icons/<GAMES file>.ico when it exists). It
+# stays out of the repository: a game's own art is game content (tools/check_content.py).
+ICON = None
 
 
 def on_path(name):
@@ -324,9 +327,27 @@ def module_glue(layout, linked, hashes, paths, version, game='totk'):
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
     number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
+    profile = GAMES[game]
     out += [f'const int rt_game_version = {number};', f'const char rt_port_version[] = {c_string(port_version())};',
-            f'const int rt_game_mua3 = {1 if game == "mua3" else 0};', '']
+            f'const int rt_game_id = {profile["id"]};',
+            f'const unsigned long long rt_game_program_id = {profile["program_id"]:#x}ull;',
+            f'const char rt_game_display_version[] = {c_string(profile["display_version"])};',
+            f'const char rt_game_name[] = {c_string(profile["name"])};',
+            f'const char rt_game_file[] = {c_string(profile["file"])};', '']
     return '\n'.join(out)
+
+
+# The games a build can be for (--game): the runtime's game id (host.h RT_GAME_*), the application id the game reads
+# back (svc GetInfo, save data), the version oe::GetDisplayVersion reports, the name the player sees (window title,
+# settings menu) and the file name of the executable, its settings file (<file>.ini) and its logs (logs/<file>.log).
+GAMES = {
+    'totk': {'id': 0, 'program_id': 0x0100F2C0115B6000, 'display_version': '1.0.0', 'name': 'TotK Recomp',
+             'file': 'totk'},
+    'mua3': {'id': 1, 'program_id': 0x010060700AC50000, 'display_version': '4.0.1', 'name': 'MUA3 Recomp',
+             'file': 'mua3'},
+    'cadence': {'id': 2, 'program_id': 0x01000B900D8B0000, 'display_version': '1.5.0',
+                'name': 'Cadence of Hyrule Recomp', 'file': 'cadence'},
+}
 
 
 def port_version():
@@ -395,6 +416,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
             objs[mod].append(o)
     rt = []
     sources = runtime_sources(skip)
+    if ICON and WIN and not make_lib:   # the manifest and the game's icon, in place of totk.rc
+        app_rc = out / 'app.rc'
+        write_if_changed(app_rc, f'1 24 "{(RUNTIME / "totk.manifest").as_posix()}"\n1 ICON "{ICON.as_posix()}"\n')
+        sources = [app_rc if p.name == 'totk.rc' else p for p in sources]
     if make_lib:
         sources = [p for p in sources if p.name not in INSTALL_SIDE]
     elif runtime_lib:
@@ -403,9 +428,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     for src in sources:
         o = runtime_object(out, src)
-        if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
+        if src.suffix == '.rc':   # windres writes no depfile: the files the .rc embeds are listed by hand
+            icon = ICON if src.name == 'app.rc' else RUNTIME / 'totk.ico'
             lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "totk.manifest")} '
-                         f'{ninja_path(RUNTIME / "totk.ico")}')
+                         f'{ninja_path(icon)}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
         rt.append(o)
@@ -734,8 +760,11 @@ def mib(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
-    ap.add_argument('--game', choices=('totk', 'mua3'), default='totk',
-                    help='which game the build is for: mua3 turns off the runtime parts tied to TotK addresses')
+    ap.add_argument('--game', choices=tuple(GAMES), default='totk',
+                    help='which game the build is for: any game but totk turns off the runtime parts tied to TotK '
+                         'addresses (GAMES)')
+    ap.add_argument('--icon', type=Path, help='the executable\'s .ico (default build/icons/<game file>.ico if present, '
+                                              'else runtime/totk.ico); kept out of the repository')
     ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
                     help='target CPU level: v3 (AVX2/FMA, default) or v2 (SSE4.2, for older CPUs; slower)')
     ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
@@ -775,6 +804,12 @@ def main():
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
+    global EXE, ICON   # the executable is named after the game (GAMES file), with its icon when there is one
+    EXE = GAMES[args.game]['file'] + ('.exe' if WIN else '')
+    icon = args.icon or ROOT / 'build' / 'icons' / f"{GAMES[args.game]['file']}.ico"
+    ICON = icon.resolve() if icon.is_file() else None
+    if args.icon and not ICON:
+        sys.exit(f'{args.icon} not found')
     set_cpu(args.cpu)
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()

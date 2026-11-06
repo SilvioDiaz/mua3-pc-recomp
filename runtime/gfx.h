@@ -37,6 +37,8 @@ typedef struct {                                           // the translator's a
     uint8_t depth_minus_w;
     uint8_t mvprev;                                        // VS: also write last frame's position (patch 0015,
                                                            // vk_mvprev.c); packed as bit 7 of the depth_minus_w byte
+    uint8_t alpha_func;                                    // FS: NVN_ALPHA_FUNC_* of the alpha test, 0 = none (ALWAYS)
+    float alpha_ref;                                       // FS: its reference; 0 without a comparing function
 } GfxShaderAnswers;
 typedef struct GfxShader GfxShader;                        // SPIR-V words + parsed reflection; owned by the cache
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -86,6 +88,7 @@ uint64_t gfx_shader_failures(void);                         // failed translatio
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
 typedef struct {
     uint16_t set, binding;      // as the SPIR-V decorates them: set 0, bindings from 1 per shader (0: support buffer)
+#define GFX_TEX_AT_IMG 128         // TEX slot base for a texture read through an image handle (gfx_shader.c handle_slot)
     int16_t slot;               // UBO: c[slot]; SSBO: storage buffer index; TEX: c2 combined slot (handle at 0x20 + 8 slot)
                                 // or, separate, texture slot (0x168 + 8 slot); IMG: image slot (0x120 + 8 slot); -1: other
     uint16_t type;              // TEX/IMG: Ryujinx SamplerType: 1 1D, 2 buffer, 3 2D, 4 3D, 5 cube | 0x100 array,

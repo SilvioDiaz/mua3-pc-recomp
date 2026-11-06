@@ -369,12 +369,22 @@ static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
     return 1;
 }
 
+// A module's writable data (.data and .bss, from data_off to the end of its image): Horizon lets MapMemory alias it,
+// and Cadence of Hyrule keeps thread stacks there as static arrays.
+static int in_module_data(uint64_t a, uint64_t n) {
+    for (int i = 0; i < ldr_count(); i++) {
+        const RtLoaded *m = ldr_module(i);
+        if (inside(a, n, (RtRange){m->base + m->data_off, m->size - m->data_off})) return 1;
+    }
+    return 0;
+}
+
 static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
     if (!n || ((dst | src | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
     if (!inside(dst, n, L.stack)) return R_INVALID_REGION;
     int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
     int in_alias = inside(src, n, L.alias);
-    if (!in_heap && !in_alias) return R_INVALID_REGION;
+    if (!in_heap && !in_alias && !in_module_data(src, n)) return R_INVALID_REGION;
     plat_mutex_lock(&lock);
     uint32_t r = R_OK;
     if (in_alias && !alias_all_mapped(src, n)) {

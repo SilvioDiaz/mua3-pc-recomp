@@ -24,6 +24,7 @@ using System.Text.Json.Nodes;
 
 static class SwshXlate
 {
+    const int CombinedBase = 0x20, ImageBase = 0x120;   // combined texture handles and image handles in c[2] (runtime/gfx_shader.c handle_slot)
     const int TexBase = 0x168, SampBase = 0x568;   // NVN 分离贴图 / 采样器句柄在 c[2] 的字节基址（每槽 8 字节；dm/gfx/tools/maxwell_refs.py 全量实测） | byte base of NVN separate texture / sampler handles in c[2] (8 bytes per slot; full measurement in dm/gfx/tools/maxwell_refs.py)
 
     sealed class Accessor : IGpuAccessor
@@ -36,6 +37,9 @@ static class SwshXlate
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 读越界 +{offset:X}（c1 长 {_c1.Length}）"); return 0; }
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
+        // Translator warnings (e.g. a global memory access whose storage buffer it cannot find: loads become 0 and
+        // stores are dropped) go into the notes of the .res.json; the default ILogger.Log discards them.
+        public void Log(string message) => Notes.Add(message);
         public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
         public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
@@ -46,17 +50,26 @@ static class SwshXlate
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
-        int TexSlot(int handle, int cbufSlot)
+        int TexSlot(int handle, int cbufSlot) => TexSlot(handle, cbufSlot, out _);
+        int TexSlot(int handle, int cbufSlot, out bool image)
         {
+            image = false;
             (int off0, _, _) = TextureHandle.UnpackOffsets(handle);
             int bytes = off0 * 4;
-            return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+            if ((cbufSlot >= 0 && (cbufSlot & 0xffff) != 2) || bytes % 8 != 0) return -1;
+            // The host's c2 layout (runtime/gfx_shader.c handle_slot): separate texture handles at TexBase (TotK),
+            // combined texture handles at 0x20 (MUA3 and other games built with older GLSLC), images at 0x120.
+            if (bytes >= TexBase && bytes < SampBase) return (bytes - TexBase) / 8;
+            if (bytes >= CombinedBase && bytes < ImageBase) return (bytes - CombinedBase) / 8;
+            if (bytes >= ImageBase && bytes < TexBase) { image = true; return (bytes - ImageBase) / 8; }
+            return -1;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
-            int slot = TexSlot(handle, cbufSlot);
+            int slot = TexSlot(handle, cbufSlot, out bool image);
             if (slot >= 0) TexQueried.Add(slot);
-            string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
+            // An image handle (a size query of a storage image) takes the image slot's type, not the texture slot's.
+            string t = slot < 0 ? null : image ? Get("img", slot) ?? Get("tex", slot) : Get("tex", slot) ?? Get("img", slot);
             if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
             if (t.EndsWith("_depth")) t = t.Substring(0, t.Length - 6);   // depth-format texture: same sampler type here; the host binds a depth view
             return t switch
@@ -92,8 +105,13 @@ static class SwshXlate
             // "early_fragment_tests": the fragment shader's NVN control byte +0x718 (the driver's early-Z-force, Ryujinx's
             // EarlyZForce); the SPIR-V then declares EarlyFragmentTests (MacNativeGames ae8f4f4).
             bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && ez.TryGetValue<bool>(out bool eb) && eb;
+            // "alpha_test": NVNalphaFunc of a fragment shader drawn with Maxwell's fixed-function alpha test (1 NEVER .. 7
+            // GEQUAL; the values are Ryujinx's AlphaTestOp), "alpha_ref_bits" its reference as float bits. Ryujinx then
+            // discards in the shader when the output alpha of target 0 fails the comparison.
+            AlphaTestOp alphaOp = _job["alpha_test"] is JsonNode at && (int)at >= 1 && (int)at <= 7 ? (AlphaTestOp)(int)at : AlphaTestOp.Always;
+            float alphaRef = _job["alpha_ref_bits"] is JsonNode ar ? BitConverter.UInt32BitsToSingle((uint)ar) : 0f;
             return new GpuGraphicsState(earlyZ, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
-                false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
+                false, false, false, depthMinusW, false, 1f, alphaOp, alphaRef, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsDepthClipControl() => true;

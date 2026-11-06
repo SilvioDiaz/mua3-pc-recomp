@@ -995,7 +995,7 @@ static void ov_display_version(Cpu *c) {
     char *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::oe::GetDisplayVersion: null output");
     memset(out, 0, 16);
-    strcpy(out, RT_MUA3 ? "4.0.1" : "1.0.0");
+    strncpy(out, rt_game_display_version, 15);
 }
 
 // StandardNetworkSystemClock::now(): seconds in x0, the host's clock; IsAccuracySufficient: false, as on a Switch
@@ -1042,3 +1042,7 @@ static void ov_language_code_make(Cpu *c) {
     ret_x(c, v);
 }
 HOST_OVERRIDE("_ZN2nn8settings12LanguageCode4MakeENS0_8LanguageE", ov_language_code_make);
+
+// time_point StandardUserSystemClock::now(): seconds in x0, the host's clock (as StandardNetworkSystemClock::now)
+static void ov_user_now(Cpu *c) { ret_x(c, (uint64_t)posix_now()); }
+HOST_OVERRIDE("_ZN2nn4time23StandardUserSystemClock3nowEv", ov_user_now);

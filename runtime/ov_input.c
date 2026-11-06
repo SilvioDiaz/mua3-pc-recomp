@@ -420,6 +420,19 @@ static void ov_vib_permitted(Cpu *c) {
     plat_mutex_unlock_shared(&vib_lock);
     ret_x(c, 0);
 }
+// bool IsVibrationPermitted(): the older SDK's form (Cadence of Hyrule), the answer in x0
+static void ov_vib_permitted_bool(Cpu *c) {
+    plat_mutex_lock_shared(&vib_lock);
+    int v = vib_allowed;
+    plat_mutex_unlock_shared(&vib_lock);
+    ret_x(c, (uint64_t)(v != 0));
+}
+// void GetMouseState(MouseState *out): GetMouseStates with a count of 1
+static void ov_mouse_state(Cpu *c) {
+    c->x[1] = 1;
+    ov_mouse_states(c);
+    ret_x(c, 0);
+}
 
 // Result detail::PermitVibration(bool): off silences the gamepad at once
 static void ov_vib_permit(Cpu *c) {
@@ -493,7 +506,10 @@ static void ov_six_state(Cpu *c) {
     ret_x(c, 0);
 }
 
-// Older SDK names (MUA3): the same functions without detail::, and GetNpadState.
+// Older SDK names (MUA3, Cadence of Hyrule): the same functions without detail::, and the one-state forms.
+HOST_OVERRIDE("_ZN2nn3hid20IsVibrationPermittedEv", ov_vib_permitted_bool);
+HOST_OVERRIDE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", ov_vib_info);
+HOST_OVERRIDE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE", ov_mouse_state);
 HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", ov_state_full_key);
 HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", ov_state_joycon);
 HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", ov_state_joycon);

@@ -250,9 +250,10 @@ int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
     uint64_t pulled = atomic_load_explicit(&m->pulled_ns, memory_order_acquire);
     if (!pulled || (now > pulled && now - pulled > m->stall_ns)) return -1;
     uint64_t have = atomic_load(&m->wr) - atomic_load_explicit(&m->rd, memory_order_acquire);
-    if (have < (uint64_t)m->target) return 0;
-    int64_t ns = (int64_t)((have - (uint64_t)m->target + 1) * 1000000000ull / (uint64_t)m->rate);
-    return ns < 500000 ? 500000 : ns;   // until the device has taken it below the target
+    uint64_t full = (uint64_t)m->target + (uint64_t)m->frame;   // one more render fits above the target
+    if (have < full) return 0;
+    int64_t ns = (int64_t)((have - full + 1) * 1000000000ull / (uint64_t)m->rate);
+    return ns < 500000 ? 500000 : ns;   // until the device has taken it below the target again
 }
 
 // Render thread only.

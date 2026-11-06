@@ -162,15 +162,38 @@ static int same_but_swizzle(const TexKey *a, const TexKey *b) {
     return !memcmp(&x, &y, sizeof x);
 }
 
+// Keys of the same storage, target, format and geometry, whatever their flags and swizzle (from xcx-recomp fe79c75,
+// MIT).
+static int same_shape(const TexKey *a, const TexKey *b) {
+    const nvn_texdesc *x = &a->d, *y = &b->d;
+    return a->addr == b->addr && x->target == y->target && x->format == y->format && x->samples == y->samples &&
+           x->width == y->width && x->height == y->height && x->depth == y->depth && x->levels == y->levels;
+}
+
 // MNG nvn_mtl.m tex_mirrored: textures whose content the CPU provides in pool memory. Display, compressible, zcull,
 // depth, multisample and GPU-only storage stays GPU-owned.
+// Tiny compressible targets in a CPU-visible pool are the exception (xcx-recomp a3eedd2, MIT): the CPU reads what the
+// GPU rendered there. XCX renders its average scene luminance into a 1x1 R32F compressible target and its exposure
+// control reads the pool bytes; left GPU-owned, the CPU read the pool's fill and the tonemap gain went wrong. Mirrored,
+// the texture write-backs return them. Larger compressible targets (G-buffer, bloom) stay GPU-owned, and so do those
+// whose storage the host cannot read (a write-back there crashed in XCX). TOTK_MIRROR_SMALL=0 restores the old rule.
+enum { MIRROR_COMPRESSIBLE_MAX = 4 << 10 };
+
 static int tex_mirrored(const tex_t *t) {
     if (!t->mem || nvn_gpu_only((uintptr_t)t->mem)) return 0;
     if (t->has_layout) return 1;
     if (!(t->pool_flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED))) return 0;
-    if (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL |
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL |
                       NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL))
         return 0;
+    if (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) {
+        static int small = -1;
+        if (small < 0) small = !(cfg_get("TOTK_MIRROR_SMALL") && !cfg_bool("TOTK_MIRROR_SMALL"));
+        if (!small || !t->L.size || t->L.size > MIRROR_COMPRESSIBLE_MAX ||
+            !plat_mem_readable((uint64_t)(uintptr_t)t->mem, 1) ||
+            !plat_mem_readable((uint64_t)(uintptr_t)t->mem + t->L.size - 1, 1))
+            return 0;
+    }
     if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
     if (t->d.format >= 0x31 && t->d.format <= 0x36) return 0;   // stencil / depth formats
     return 1;
@@ -923,6 +946,33 @@ static int alias_copy(Tex *e, const Tex *src) {
     return 1;
 }
 
+// TOTK_TRACE_3D=1: logs every 3D texture made and every GPU write to a texture at the address of one (at most 200
+// lines). MUA3's forward pass samples a 1x1x1 RGBA16F 3D texture as its fog volume (colour * a + rgb); it stays zero,
+// so the scene renders black, and nothing in a frame dump writes it.
+static int trace3d = -1;
+static uint64_t t3d_addr[64];
+static int t3d_n;
+static volatile int32_t t3d_lines;
+static void trace_3d(const char *what, const tex_t *t) {
+    if (trace3d < 0) trace3d = rt_knob("TRACE_3D", "0");
+    if (!trace3d || !t) return;
+    uint64_t a = (uintptr_t)t->mem;
+    int hit = t->d.target == NVN_TEXTURE_TARGET_3D;
+    for (int i = 0; i < t3d_n && !hit; i++) hit = t3d_addr[i] == a;
+    if (!hit) return;
+    if (t->d.target == NVN_TEXTURE_TARGET_3D) {
+        int known = 0;
+        for (int i = 0; i < t3d_n; i++) known |= t3d_addr[i] == a;
+        if (!known && t3d_n < 64) t3d_addr[t3d_n++] = a;
+    }
+    if (plat_inc32(&t3d_lines) > 200) return;
+    uint64_t head = 0;
+    if (!nvn_gpu_only(a) && t->L.size >= 8) memcpy(&head, t->mem, 8);
+    rt_log("vk: trace3d: %s addr %#llx target %d format %#x %ux%ux%u levels %u flags %#x pool %#x mirrored %d storage %016llx",
+           what, (unsigned long long)a, t->d.target, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels,
+           t->d.flags, t->pool_flags, tex_mirrored(t), (unsigned long long)head);
+}
+
 static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
@@ -933,6 +983,7 @@ static Tex *entry_of(const tex_t *t) {
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
         if (!(e = create_tex(t, &k, tex_alias))) return NULL;
+        trace_3d("made", t);
         perf_count(PERF_CNT_TEX_NEW);
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
@@ -1015,6 +1066,7 @@ static void wb_cfg_init(void) {
 
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
+    trace_3d("gpu write", t);
     vk_exec_frame_written(t);
     lock();
     Tex *e = entry_of(t);
@@ -1111,14 +1163,18 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
         // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
-        Tex *own = e, *any = NULL;
+        // Next comes one of the same shape with other flags (xcx-recomp fe79c75): XCX's shadow atlas renders through a
+        // COMPRESSIBLE texture and is sampled through a COMPRESSIBLE | IMAGE one, while a smaller newer texture shares
+        // the storage; following that one read the atlas through the wrong layout.
+        Tex *own = e, *any = NULL, *shape = NULL;
         e = NULL;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p->released) continue;
             if (!any) any = p;
             if (same_but_swizzle(&p->key, &k)) { e = p; break; }
+            if (!shape && same_shape(&p->key, &k)) shape = p;
         }
-        if (!e) e = any ? any : own;
+        if (!e) e = shape ? shape : any ? any : own;
     }
     if (!e) e = s->t.mem ? entry_of(&s->t) : NULL;
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
@@ -1140,6 +1196,31 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
+// Why slot id resolves to no image, for the frame dump: not registered, no storage, or its descriptor (the image could
+// not be made from it).
+// A buffer texture (NVN_TEXTURE_TARGET_BUFFER) in slot id: its storage address, NVN format and texel count. These have
+// no image (create_tex): the replay binds them as texel buffer views over the pool memory. Texture lock held.
+int vk_texture_buffer_locked(int id, uint64_t *addr, int *format, uint32_t *texels) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
+    const tex_t *t = &tslots[id].t;
+    if (t->d.target != NVN_TEXTURE_TARGET_BUFFER || !t->mem || !t->d.width) return 0;
+    *addr = (uintptr_t)t->mem, *format = t->d.format, *texels = t->d.width;
+    return 1;
+}
+
+void vk_texture_slot_info(int id, char *b, int n) {
+    lock();
+    if (id < 0 || id >= ntslots || !tslots[id].used) {
+        snprintf(b, (size_t)n, "slot not registered");
+    } else {
+        const tex_t *t = &tslots[id].t;
+        snprintf(b, (size_t)n, "nvn target %d format %#x %ux%ux%u levels %u samples %d flags %#x storage %s at %#llx",
+                 t->d.target, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.samples, t->d.flags,
+                 t->mem ? "mapped" : "none", (unsigned long long)(uintptr_t)t->mem);
+    }
+    unlock();
+}
+
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
@@ -1151,6 +1232,22 @@ uint64_t vk_texture_slot_token(int id) {
     return v ? (v >> 16) << 32 | __atomic_load_n(&agen[v & 0xffff], __ATOMIC_ACQUIRE) : 0;
 }
 uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
+
+// The live depth image at img's storage address with img's size whose depth format holds img's bits (R16_UNORM: D16,
+// R32_SFLOAT: D32), or NULL. MUA3 renders its shadow maps as D16 and samples them through an R16_UNORM texture with a
+// compare sampler; Maxwell compares any one-channel texel, Vulkan only depth formats (VUID-vkCmdDraw-None-06479), and a
+// colour image bound over a depth image's memory need not read its texels. Texture lock held.
+const VkTexImage *vk_texture_depth_partner(const VkTexImage *img) {
+    VkFormat want = img->format == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM
+                  : img->format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+    if (!want || (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return NULL;
+    uint64_t a = img->addr;
+    for (Tex *p = nvn_hm_get(&by_addr, &a); p; p = p->next_at)
+        if (!p->released && p->pub.format == want && (p->pub.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+            p->pub.width == img->width && p->pub.height == img->height && p->pub.samples == img->samples)
+            return &p->pub;
+    return NULL;
+}
 
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
     lock();
@@ -1443,6 +1540,11 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
 // memcpy once the GPU is done, and the copy then carried zeros. Such a read writes the image back first.
 static void write_back(Tex *e) {
     const nvn_texdesc *d = &e->t.d;
+    // Storage the host has stopped mapping since the texture was made takes no copy (xcx-recomp a3eedd2)
+    if (!e->t.L.size || !plat_mem_readable((uint64_t)(uintptr_t)e->t.mem, e->t.L.size)) {
+        e->gpu_dirty = 0;
+        return;
+    }
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear || is3d ? 1 : e->pub.layers;
     for (uint32_t lv = 0; lv < levels; lv++)
@@ -1480,6 +1582,7 @@ void vk_texture_storage_bound_locked(const VkTexImage *img) {
     Tex *e = (Tex *)img;   // pub is the first member
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
+    trace_3d("storage bind", &e->t);
 }
 
 uint64_t vk_texture_last_write(const tex_t *t) {

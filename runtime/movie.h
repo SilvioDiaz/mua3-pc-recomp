@@ -31,6 +31,8 @@ enum { MOVIE_TYPE_VP9 = 3, MOVIE_MODE_BUFFER = 1, MOVIE_FORMAT_NV12 = 4, MOVIE_F
 
 typedef struct { uint64_t frames, decode_ns, max_ns, errors, dropped, handed; } MovieStats;
 
+void movie_note_open(const char *path);                    // romfs.c: an .mp4 the game opened (MUA3's H.264 movies
+                                                           // keep SPS/PPS in the file's avcC, not in the stream)
 void movie_set_guest(const MovieGuest *g);                 // probe: stand-ins instead of the modules
 void movie_set_clock(uint64_t (*clock)(void));             // probe: a fake clock (ns) for the pacing; NULL = real
 void movie_set_pace(int on);                               // probe: 0 hands every decoded frame over at the next tick

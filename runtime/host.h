@@ -191,9 +191,18 @@ extern const int rt_game_version;                          // the game build: 11
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
 #define RT_V110 (rt_game_version == 110)                    // 1.1.0: its own boot constants and data slots
 #define RT_V143 (rt_game_version >= 143)
-extern const int rt_game_mua3;                             // 1 in a Marvel Ultimate Alliance 3 build (--game mua3)
-#define RT_MUA3 (rt_game_mua3 != 0)                        // off: every hook tied to a TotK address or constant
-#define RT_PROGRAM_ID (RT_MUA3 ? 0x010060700ac50000ull : 0x0100f2c0115b6000ull)   // the game's application id
+// The game a build is for (tools/build_game.py --game, its GAMES table, written into modules.c).
+enum { RT_GAME_TOTK = 0, RT_GAME_MUA3 = 1, RT_GAME_CADENCE = 2 };
+extern const int rt_game_id;
+extern const unsigned long long rt_game_program_id;        // the game's application id
+extern const char rt_game_display_version[];               // what oe::GetDisplayVersion reports
+extern const char rt_game_name[];                          // the name the player sees: window title, settings menu
+extern const char rt_game_file[];                          // <file>.exe, <file>.ini, logs/<file>.log
+#define RT_TOTK (rt_game_id == RT_GAME_TOTK)
+#define RT_MUA3 (rt_game_id == RT_GAME_MUA3)
+#define RT_CADENCE (rt_game_id == RT_GAME_CADENCE)
+#define RT_OTHER_GAME (!RT_TOTK)                           // every hook tied to a TotK address or constant is off
+#define RT_PROGRAM_ID ((uint64_t)rt_game_program_id)
 
 // ---- kernel (kernel.c)
 typedef struct RtThread RtThread;
@@ -266,7 +275,8 @@ void res_heapdef_served(void);                             // romfs.c serves the
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 float res_dlss_lod_bias(void);                             // TOTK_DLSS upscaling: texture LOD bias (<= 0)
 int res_dlss_mode(const char *mode);                       // TOTK_DLSS changed while running: new scene size
-void res_fn_hit(uint64_t addr, uint64_t x0);               // main.c fnprof_hit: catches the renderer at start
+void res_fn_hit(uint64_t addr, uint64_t x0);               // fnprof.c fnprof_hit: catches the renderer at start
+void fnprof_frame(uint64_t frame);                         // fnprof.c: TOTK_FNPROF window, per presented frame
 void res_present(Cpu *c);                                  // nvnQueuePresentTexture: applies a pending scene size
 void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
                                                            // until res_init switched the sets on)
