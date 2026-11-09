@@ -29,6 +29,7 @@ executable. The game's ARM64 code is turned into C and compiled for PC; this is 
 | Boot, initialisation, audio, gamepad, user account and save data | ✅ |
 | Marvel logo, title screen and main menu | ✅ |
 | H.264 movies (opening cutscene with sound and subtitles) | ✅ |
+| Movies inside the first stage (crashed at the second one before) | ✅ |
 | Reaching gameplay (first stage, HUD, checkpoint) | ✅ about 30 fps |
 | Lit 3D scene (characters and level) | ✅ first stage (one spot still looks too bright) |
 | Actually playing, finishing the game | ❌ untested |
@@ -78,6 +79,19 @@ found yet, so it is replaced by our own shader that lists every triangle
 Still open: one spot of the stage (the floor of glowing panels) looks brighter and more cyan than the original game.
 Details and the ruled-out hypotheses are in [docs/mua3-port.md](docs/mua3-port.md) (in Portuguese).
 
+### Crash at the second cutscene (fixed)
+
+The game crashed a few minutes in, when the stage opened its second movie: the game's heap was corrupt. A new heap
+checker (`TOTK_HEAP_CHECK=1`, [runtime/heap_check.c](runtime/heap_check.c)) walks the game's heap every frame and showed
+it break right after the first movie: memory from outside the heap was being freed into it.
+
+The cause was in the loader. The movie library allocated with the system SDK's `operator new[]` but freed with the
+game's own `operator delete[]`, which belongs to the game's heap. On the console, the game's `new` and `delete` replace
+the SDK's for every module, because the system loader binds a symbol with default visibility to the first module in
+load order that defines it (the game). Our loader bound a module's imports to its own copy first. It now follows the
+console's rule ([runtime/loader.c](runtime/loader.c) `resolve`), and the opening movies play one after another without
+a crash.
+
 ## What was adapted from TotK Recomp
 
 - An `mua3` game profile (title ids, versions, expected hashes) in [tools/game_profile.py](tools/game_profile.py) and
@@ -93,6 +107,9 @@ Details and the ruled-out hypotheses are in [docs/mua3-port.md](docs/mua3-port.m
 - H.264 + AAC movie decoding (`runtime/movie_codec_win.c`), with SPS/PPS read from the MP4's `avcC`.
 - Shader translator (from Ryujinx) with NaN/Inf fixes and Maxwell's FMZ and NaN-aware min/max/clamp behaviour.
 - A function profiler (`TOTK_FNPROF`) and a write tracer to investigate the dark scene.
+- Symbol binding as on the console: a symbol with default visibility binds to the first module in load order that
+  defines it, so the game's `operator new`/`delete` replace the SDK's everywhere.
+- A heap checker (`TOTK_HEAP_CHECK`) that walks MUA3's heap at every frame and logs the first broken block.
 
 Fixes were also brought over from other open recomps: Cadence of Hyrule, Astral Chain, Xenoblade Chronicles X, Fire
 Emblem: Three Houses and Pokopia; fefw-recomp, DKB Recomp and hwaoi-recomp were read for how they replay geometry

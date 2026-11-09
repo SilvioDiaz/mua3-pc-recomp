@@ -259,6 +259,9 @@ void account_uid(uint64_t out[2]);                         // the local user's n
 // ---- movies (ov_movie.c)
 void movie_tick(Cpu *c);                                   // at every present, on the presenting guest thread: hands
                                                            // decoded movie frames over when due, signals their events
+// ---- heap check (heap_check.c): TOTK_HEAP_CHECK
+void heap_check_present(Cpu *c);                           // at every present, on the presenting guest thread: walks
+                                                           // MUA3's heaps and logs the first broken block header
 // ---- camera speed (camera_speed.c): TOTK_STICK_SENS
 float cam_speed_wanted(void);                              // the factor TOTK_STICK_SENS asks for, 0.1 to 3
 float cam_speed_applied(void);                             // the factor in effect: 1 until romfs.c serves the pack

@@ -404,6 +404,31 @@ com a referência. Com a regra padrão (play11, fala do Drax logo depois) també
 com cor. Então `TOTK_TEXBUF` não é a causa e fica como está. Pendente: comparar o ponto da play9 com uma referência do
 mesmo lugar; o vermelho puro dos personagens no t3 pode ser máscara do jogo.
 
+## Rodada 14 (2026-11-09): crash no segundo vídeo (heap corrompido) e a ligação de símbolos
+
+Sintoma (play9, ~206 s de jogo): access violation lendo `0xffffffffffffffff` (ponteiro não canônico) em `main+0x138d760`,
+o `free` do heap geral do jogo, chamado pelo `delete[]` de `android::MPEG4Extractor::parseITunesMetaData` ao abrir
+`EV_0101_02.mp4`. Os 127 `.mp4` têm os mesmos metadados (só `©too`) e o primeiro vídeo tocou, então o arquivo não era a
+causa: o campo "bloco anterior" do cabeçalho do bloco estava lixo.
+
+O alocador (objeto em `0x7003d4e7d0`, métodos virtuais em `main+0x138f930..fb00` com a trava global
+`[[0x7002188460]]+0xa0`): cabeçalho de 0x20 bytes por bloco (`+0` bloco anterior, `+8` tamanho, negativo em uso,
+`+0x10/+0x18` info de quem alocou ou links da lista livre); objeto: `+0x18` tamanho do cabeçalho, `+0x20` cabeças das
+listas livres, `+0x28` primeiro bloco, `+0x30` fim. Heap de ~3 GB em 12 blocos (sub-heaps).
+
+Ferramenta nova: `TOTK_HEAP_CHECK=<n>` (`runtime/heap_check.c`) percorre esse heap a cada n presents, com a trava do
+jogo, e registra o primeiro cabeçalho quebrado com os blocos vizinhos e um dump. Na play12 acusou, logo depois de
+`EV_0101_01.mp4`, blocos livres com links para `0x1eec0xxxx`, fora do heap (que termina em `0x1eea00000`), a mesma região
+do buffer do crash.
+
+Causa: o `new[](nothrow)` que o subsdk0 importa é o da SDK, que chama `operator new[]` pelo PLT da própria SDK; o
+`loader.c` ligava esse import à cópia da própria SDK (regra "definição própria primeiro"), enquanto o `delete[]` ia para
+o do jogo (`main+0x175f50`). Alocava num alocador e liberava no heap do jogo. O rtld do Horizon resolve símbolos de
+visibilidade padrão pela lista global em ordem de carga (main primeiro), e só os protected/hidden localmente. O
+`resolve` do `loader.c` passou a fazer o mesmo: 403 definições próprias agora vão para a cópia de um módulo anterior
+(libc++ duplicada, tabelas do Opus, `operator new`). Na play13 o `new[]` da SDK aponta para `main+0x175ed0`, o heap ficou
+íntegro (10800+ varreduras) e os vídeos `EV_0101_01..03` passaram sem crash.
+
 ## Próximos marcos
 
 1. (feito na rodada 4) Reproduzir o vídeo sob demanda e descobrir por que o quadro decodificado não aparece (o jogo usa

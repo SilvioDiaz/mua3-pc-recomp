@@ -319,13 +319,29 @@ static void mark_used(int observers, const char *name) {
         if (!strcmp(hostfn_table_name(observers, i), name)) (observers ? obs_used : ovr_used)[i] = 1;
 }
 
-// Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, own definition, other modules in load
-// order, weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
+// A module's own definition of a default-visibility symbol that an earlier module in load order also defines: the
+// earlier one wins, as Horizon's rtld binds such symbols through the global module list. MUA3's main defines
+// operator new/delete; the SDK's operator new[](nothrow) calls operator new[] through its own PLT, and binding that to
+// the SDK's copy while delete[] went to main's heap freed SDK allocations into the game's heap (play 9 crash).
+static uint32_t interposed;
+
+// Order: observer (JUMP_SLOT only), override by name, the definition rtld would pick (protected or hidden: the module's
+// own; default visibility: the first module in load order that defines it), weak -> 0, strong -> named fatal stub.
+// Overrides also replace a module's own symbols.
 static Res resolve(Mod *m, uint32_t si, int jump) {
     Res *cache = jump ? &m->res_jump[si] : &m->res_plain[si];
     if (cache->kind != RES_UNSET) return *cache;
     const char *name = sym_name(m, si);
-    uint64_t guest = sym_defined(m, si) ? m->pub.base + m->syms[si].value : find_symbol(name, NULL);
+    uint64_t guest = find_symbol(name, NULL);
+    if (sym_defined(m, si)) {
+        uint64_t own = m->pub.base + m->syms[si].value;
+        if ((m->syms[si].other & 3) || !guest) guest = own;   // STV_PROTECTED / STV_HIDDEN bind locally
+        else if (guest != own && interposed++ < 40) {
+            char at[128];
+            rt_log("loader: %s %s binds to %s instead of its own copy", m->pub.name, name,
+                   ldr_describe(guest, at, sizeof at));
+        }
+    }
     GuestFn f;
     Res r;
     if (jump && (f = hostfn_observer(name))) {
@@ -456,6 +472,7 @@ void ldr_load(const char *exefs_dir) {
         count_imports(&mods[i]);
         mods[i].pub.ctor_flag = decode_ctor_flag(&mods[i]);
     }
+    if (interposed) rt_log("loader: %u own definitions bound to an earlier module's copy", interposed);
     verify_identity();
     for (int i = 0; i < nmods; i++) seal(&mods[i]);
     for (int i = 0; i < nmods; i++) {
