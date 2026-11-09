@@ -114,7 +114,9 @@ void vk_caps_init(VkCtx *c) {
     // BotW and TotK on AMD). The translator biases gather coordinates by the host's sub-texel precision; NVIDIA rounds
     // as Maxwell does. TOTK_GATHER_BIAS=<bits> forces it (0: off).
     uint32_t gather = env_u32("TOTK_GATHER_BIAS", c->props.vendorID == 0x10de ? 0 : l->subTexelPrecisionBits);
-    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
+    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, c->has_gs_passthrough && c->has_viewport_array2);
+    rt_log("vk caps: geometry passthrough %s", c->has_gs_passthrough ? "native (VK_NV_geometry_shader_passthrough, "
+                                                                       "VK_NV_viewport_array2)" : "emulated");
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (TOTK_GATHER_BIAS)", gather);
 
     char dv[32];

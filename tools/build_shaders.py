@@ -1,6 +1,6 @@
-"""Compile the runtime's own GLSL shaders (runtime/shaders/*.comp, *.vert, *.frag) into C headers of SPIR-V words.
+"""Compile the runtime's own GLSL shaders (runtime/shaders/*.comp, *.vert, *.geom, *.frag) into C headers of SPIR-V words.
 
-Each runtime/shaders/<name>.comp (or .vert, .frag: one name per shader) becomes runtime/<name>_spv.h, which declares `static const uint32_t <name>_spv[]`
+Each runtime/shaders/<name>.comp (or .vert, .geom, .frag: one name per shader) becomes runtime/<name>_spv.h, which declares `static const uint32_t <name>_spv[]`
 and records the SHA-256 of the source it came from. The headers are committed, so building totk.exe needs no shader
 compiler; tools/build_game.py refuses to build when a header no longer matches its source. Run this after editing a
 shader. Needs glslc and spirv-val from MSYS2 UCRT64 (package mingw-w64-ucrt-x86_64-shaderc, spirv-tools).
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN = Path(r'C:\msys64\ucrt64\bin')   # Windows; elsewhere glslc and spirv-val come from PATH
 WIN = os.name == 'nt'
 TARGET = 'vulkan1.1'
-STAGES = {'.comp': 'compute', '.vert': 'vertex', '.frag': 'fragment'}
+STAGES = {'.comp': 'compute', '.vert': 'vertex', '.geom': 'geometry', '.frag': 'fragment'}
 
 
 def source_hash(src):

@@ -51,9 +51,10 @@
 #define KEY_VERSION 4                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids);
                                                            // translator changes are covered by its identity
-#define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
+#define IN_VERSION 3                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
-                                                           // (2: alpha test function and reference)
+                                                           // (2: alpha test function and reference; 3: geometry
+                                                           // shader input topology)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
 #define USE_VERSION 1
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
@@ -122,6 +123,7 @@ static char xlate_exe[PATH_CAP];
 static uint8_t xlate_id[32];                               // translator identity (see the keys at the top)
 static int host_f64 = 1, host_set;                         // gfx_shader_set_host
 static uint32_t host_sbuf, host_sg[3] = {32, 32, 32}, host_gather;
+static int host_native_gs;                                 // NVIDIA passthrough and viewport mask extensions enabled
 static PlatOnce paths_once = PLAT_ONCE_INIT;
 
 // ---- small helpers
@@ -316,16 +318,18 @@ static void paths(void) { plat_once(&paths_once, init_paths, NULL); }
 // Host answers (vk_caps.c, at device creation, before any translation). Answers other than the defaults (Float64,
 // exact storage offsets, 32 lanes, no gather bias) are mixed into the translator identity, so they get their own cache
 // keys.
-void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits) {
+void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int native_gs) {
     paths();
     if (host_set++) return;
-    host_f64 = float64, host_sbuf = sbuf_align, host_gather = gather_bits;
+    host_f64 = float64, host_sbuf = sbuf_align, host_gather = gather_bits, host_native_gs = native_gs != 0;
     memcpy(host_sg, subgroup, sizeof host_sg);
-    if (float64 && !sbuf_align && subgroup[0] == 32 && subgroup[1] == 32 && subgroup[2] == 32 && !gather_bits) return;
+    if (float64 && !sbuf_align && subgroup[0] == 32 && subgroup[1] == 32 && subgroup[2] == 32 && !gather_bits && !native_gs)
+        return;
     uint8_t buf[32 + 96];
     int n = snprintf((char *)buf + 32, 96, "TKHO f64=%d sbuf=%u sg=%u,%u,%u", float64, sbuf_align, subgroup[0], subgroup[1],
                      subgroup[2]);
     if (gather_bits) n += snprintf((char *)buf + 32 + n, (size_t)(96 - n), " gather=%u", gather_bits);
+    if (native_gs) n += snprintf((char *)buf + 32 + n, (size_t)(96 - n), " nativegs");
     memcpy(buf, xlate_id, 32);
     rt_sha256(buf, 32 + (size_t)n, xlate_id);
     rt_log("gfx_shader: host options %s: own shader cache keys", (char *)buf + 37);
@@ -544,7 +548,8 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"gs\"", 4) || !strncmp(st, "\"ps\"", 4) ||
+                  !strncmp(st, "\"cs\"", 4));
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -849,12 +854,50 @@ out:
     free(cc);
 }
 
+// Logs a shader whose translation lost global memory accesses. When the translator cannot tell which storage buffer a
+// global access goes through (Ryujinx GlobalToStorage.cs, a pointer it cannot trace to the driver's storage table), it
+// notes "Failed to find storage buffer for global memory operation" and turns loads into 0 and drops stores and
+// atomics. The translated SPIR-V then shows no store at all, so a shader that should fill a buffer looks like a pure
+// reader. Runs once per shader entering the memory cache; the first 64 get a line each.
+static void note_lost_global_access(const GfxShader *s, const char *stage) {
+    static const char needle[] = "Failed to find storage buffer for global memory operation";
+    static volatile int32_t n_logged;
+    const char *js = s->reflection, *p = js;
+    int n = 0;
+    char ops[160] = "";
+    size_t used = 0;
+    while ((p = strstr(p, needle))) {
+        p += sizeof needle - 1;
+        n++;
+        // The operation name follows inside JSON-escaped quotes: a backslash, u0022 (System.Text.Json's default), or a
+        // backslash and a quote.
+        const char *q = p;
+        while (*q == ' ') q++;
+        if (!strncmp(q, "\\u0022", 6)) q += 6;
+        else if (!strncmp(q, "\\\"", 2)) q += 2;
+        size_t k = 0;
+        while (isalnum((unsigned char)q[k]) || q[k] == '_') k++;
+        if (k && used + k + 2 < sizeof ops) {
+            if (used) ops[used++] = ' ';
+            memcpy(ops + used, q, k), used += k, ops[used] = 0;
+        }
+    }
+    if (!n) return;
+    int32_t i = plat_inc32(&n_logged);
+    if (i <= 64)
+        rt_log("gfx_shader: %s shader %02x%02x%02x%02x%02x%02x%02x%02x lost %d global memory access(es): %s", stage,
+               s->key[0], s->key[1], s->key[2], s->key[3], s->key[4], s->key[5], s->key[6], s->key[7], n, ops);
+    else if (!(i & (i - 1)))
+        rt_log("gfx_shader: %d shaders so far lost global memory accesses (the first 64 are named)", i);
+}
+
 static void reflect(GfxShader *s) {
     static const char *const kinds[GFX_RES_KINDS] = {"cbufs", "sbufs", "textures", "images"};
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS
+             : !strcmp(stage, "gs") ? GFX_STAGE_GS : GFX_STAGE_VS;
     s->mvprev_banks = (uint32_t)json_int(js, js + strlen(js), "mvprev_banks", 0);
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
@@ -863,6 +906,7 @@ static void reflect(GfxShader *s) {
     }
     reflect_spirv(s);
     patch_txd_transpose(s);
+    note_lost_global_access(s, stage);
 }
 
 // ---- use masks (see the cache key at the top)
@@ -1070,6 +1114,7 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     *p++ = (uint8_t)(a->depth_minus_w | (a->mvprev ? 0x80 : 0));
     *p++ = a->alpha_func;
     memcpy(p, &a->alpha_ref, 4), p += 4;
+    *p++ = a->gs_topo;
     return (size_t)(p - o);
 }
 
@@ -1103,6 +1148,7 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     o->shared_bytes = a->shared_bytes;
     o->mvprev = a->mvprev;   // another translation, not an answer the use mask covers
     o->alpha_func = a->alpha_func, o->alpha_ref = a->alpha_ref;   // set for fragment shaders only (vk_pipeline_answers)
+    o->gs_topo = a->gs_topo;   // set for geometry shaders only; it picks the SPIR-V's input primitive
 }
 
 // The cache key of an input id under the current translator.
@@ -1189,12 +1235,17 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
        ae8f4f4). Without it a shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test
        after the depth prepass fails along contour lines. Already part of the code hash (the whole control section). */
     if (!strcmp(stage, "ps") && (control[0x718] & 1)) o += sprintf(o, ",\"early_fragment_tests\":true");
-    int si = !strcmp(stage, "vs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;   // gfx_shader_set_host answers
+    // A geometry shader's input primitive comes from the draw, not the program: the SPIR-V declares it and Vulkan
+    // requires it to match the draw's topology.
+    if (!strcmp(stage, "gs") && a && a->gs_topo) o += sprintf(o, ",\"topology\":%u", a->gs_topo - 1u);
+    // gfx_shader_set_host answers: vertex (also geometry), fragment, compute
+    int si = !strcmp(stage, "vs") || !strcmp(stage, "gs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;
     if (!host_f64) o += sprintf(o, ",\"softfloat64\":true");
     if (a && a->mvprev && !strcmp(stage, "vs")) o += sprintf(o, ",\"mvprev\":true");
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);
     if (host_sg[si] != 32) o += sprintf(o, ",\"subgroup\":%u", host_sg[si]);
     if (host_gather) o += sprintf(o, ",\"gather_bias\":%u", host_gather);
+    if (host_native_gs) o += sprintf(o, ",\"native_gs\":true");
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
     o += sprintf(o, "\"}");
@@ -1259,7 +1310,8 @@ typedef struct {
 
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_GS ? "gs" : stage == GFX_STAGE_FS ? "ps"
+                  : stage == GFX_STAGE_CS ? "cs" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     uint32_t c1_off;
     memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);
@@ -1806,8 +1858,8 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 //                       code[length], c1. One per code hash; written before the answers that name it. Game content:
 //                       it stays in the ignored pipeline cache directory.
 // A file with another header is rewritten; a torn tail (killed process) is cut off at open.
-#define ANS_VERSION 2
-#define ANS_PACKED 152                                     // pack_answers' size
+#define ANS_VERSION 3                                      // 3: gs_topo appended to the packed answers
+#define ANS_PACKED 153                                     // pack_answers' size
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
 #define PRG_VERSION 1
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
@@ -1875,7 +1927,8 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     memcpy(&a->shared_bytes, p, 4), p += 4;
     a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7, p++;
     a->alpha_func = *p++;
-    memcpy(&a->alpha_ref, p, 4);
+    memcpy(&a->alpha_ref, p, 4), p += 4;
+    a->gs_topo = *p;
 }
 
 // Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.

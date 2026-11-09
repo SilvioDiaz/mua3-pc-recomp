@@ -287,6 +287,123 @@ Bate com a rodada 10: os draws do G-buffer têm contagem 0 nos argumentos indire
 - Fora: o resto é do Xenoblade (60 fps, interface larga, Linux, AMD RDNA2) ou já existe na nossa base.
 - Build e `--selftest` ok; ainda não testado no jogo.
 
+## Rodada 12 (2026-11-09): dois logs para achar quem preenche os argumentos indiretos
+
+No DKB Recomp (Donkey Kong Bananza, mesma base TotK; visto no hwaoi-recomp, devlog de 03/11) os registros indiretos
+ficavam em `{0, 1, 0, 0, 0}` como os do G-buffer do MUA3. Duas causas lá: o reset é um draw que grava por ponteiros
+(o tradutor apagava os stores) e as contagens vêm de um **geometry shader**, que o runtime não executava. O nosso
+runtime também não executa geometry nem tesselação: `gfx_shader` só pede vs, ps e cs ao tradutor.
+
+- `vk_exec_draw.c` `note_unreplayed_stages`: no `BindProgram`, loga `vk_exec: program ... has a geometry shader ...,
+  which the replay skips` (também tess control/eval), os 32 primeiros programas.
+- `gfx_shader.c` `note_lost_global_access`: loga `gfx_shader: <estágio> shader <hash> lost N global memory
+  access(es): Store ...` para cada shader cujo `.res.json` tem a nota "Failed to find storage buffer" do
+  `GlobalToStorage.cs` (loads viram 0, stores e atomics somem). Vale para os três estágios, não só compute.
+- Compilam (`clang -fsyntax-only`); parser das notas testado com as duas formas de aspas do JSON. Ainda não rodado
+  no jogo: a pasta `build` foi apagada e precisa ser refeita (extração, lift, build).
+- Na próxima execução até o gameplay: procurar essas duas linhas no log. Um geometry shader ligado no pré-passe ou um
+  store perdido num vertex shader explica o bloco vazio.
+
+## Rodada 13 (2026-11-09): geometry shaders no replay
+
+Cache de shaders do Ryujinx do MUA3 (`%APPDATA%\Ryujinx\games\010060700ac50000\cache\shader\guest.*`, Brotli com 1
+byte de algoritmo na frente, cabeçalho SPH lido): 224 programas, 124 pixel, 76 vertex, 14 compute, **1 geometry**
+(`0xe7ca1a16`, 1456 bytes), 0 tesselação, 9 entradas que não abriram. O geometry shader tem `DoesGlobalStore` no SPH,
+3 `STG`, 12 `ALD`, 5 `SHFL`, saída máxima de 1 vértice e nenhuma instrução `OUT`: não desenha, só lê os vértices e
+grava em memória. É o padrão do DKB (contagens dos draws indiretos vindas de um geometry shader). Referência lida: o
+replay do fefw-recomp (GPL, em `..\refs\fefw-recomp`, só para comportamento; o código aqui é nosso).
+
+- `gfx_shader.c` / `tools/xlate/Program.cs`: estágio `gs`. A topologia de entrada vem do draw
+  (`GfxShaderAnswers.gs_topo`, `"topology"` no pedido) porque o SPIR-V a declara e o Vulkan exige que bata.
+  `IN_VERSION` 3, `ANS_VERSION` 3 (o byte novo vai no fim do `pack_answers`, `tools/xlate_diff.py` continua lendo).
+- `vk_exec_draw.c`: `prepare_draw` pede o geometry shader do programa (`NVN_STAGE_GS`) a cada draw (o memo guarda só
+  vs/fs); pendente espera ou pula como os outros. Tabela de storage buffers do c0 do geometry em 0x410
+  (`c0_ssbo_base`: ordem de estágios do Maxwell, 0x110 + 0x100·(estágio − 1), bate com vertex 0x110 e fragment 0x510;
+  **não confirmado** num log do MUA3). Se estiver errado, aparece `a storage buffer whose address is at c0+... (stage
+  2) is not replayed`. O redesenho de movimento por objeto pula draws com geometry.
+- `vk_pipeline.c`: pipeline com geometry usa sempre um layout único (vertex, geometry, fragment em sequência no set 0),
+  sem layouts independentes nem GPL (build monolítico; `gpl_link` recusa sozinho). O vertex ganha as saídas que o
+  geometry lê e não existem, o geometry as que o fragment lê. `KEYS_VERSION` 4; pipelines com geometry ficam fora do
+  arquivo de chaves (o prebuild não sabe montar o estágio).
+- Tesselação continua sem replay (o MUA3 não usa no trecho do cache).
+- Patches de warp do fefw-recomp (`portable-warp-*`) não entraram: só mudam algo quando o subgrupo não tem 32 lanes, e
+  na NVIDIA tem.
+- Compila: `clang -fsyntax-only -Wall` limpo nos 4 arquivos C, `dotnet build` do tradutor sem avisos.
+
+**play1**: o geometry shader aparece, mas `reflection_valid` só aceitava `vs/ps/cs` e recusava o `.res.json` do `gs`
+(corrigido). O SPIR-V tinha `GeometryShaderPassthroughNV` e `ShaderViewportMaskNV`: o shader é *passthrough* (SPH
+GpPassthrough; por isso nenhuma instrução `OUT`), não "sem desenho". O tradutor agora responde não para passthrough e
+viewport mask (`Program.cs`), e o Ryujinx escreve o laço de emissão (9 `OpEmitVertex`, `spirv-val` ok). A escrita de
+ViewportMask (atributo 0x3A0) é descartada: o triângulo vai só ao viewport 0 (pendente: ligar
+`VK_NV_geometry_shader_passthrough`/`VK_NV_viewport_array2` na NVIDIA). Tabela do c0 confirmada: `cb_offset` 0x410 e
+0x420, nenhum store perdido.
+
+**play2** (F7, quadro 2353, `build\upd\dump`): o geometry shader roda no **pré-passe** (passe 30, 456 draws), com os dois
+SSBOs ligados exatamente no bloco dos argumentos indiretos (registros 0x139de5910, índices 0x1395e5900). É ele o
+culling que preenche o bloco. **O G-buffer (passe 31) deixou de sair zerado**: t0 22550 cores distintas, t1 60504, t3
+15974; personagens e cenário aparecem, mas fragmentados (muitos triângulos faltando), enquanto a profundidade do
+pré-passe está completa. O shader compacta por warp: 2 `OpGroupNonUniformBallot`, 1 `OpBitCount`, 1 `OpAtomicIAdd`,
+1 `OpGroupNonUniformShuffle` (o líder reserva espaço e repassa a base por shuffle). Suspeita: ballot/shuffle num
+geometry shader no Vulkan não agrupa as invocações como o warp do Maxwell, ou o SHFL do Ryujinx (índice sem máscara
+de 5 bits, origem inválida; é o que o `portable-warp-shuffle.patch` do fefw-recomp trata) erra a base. Próximo: ler o
+GLSL/SPIR-V da compactação, conferir `supportedStages` de subgrupo para geometry, e despejar o bloco de índices.
+
+**play3/play4** (diagnóstico): subgrupo em geometry suportado na RTX 3060 (`stages 0x3fff`, 32 fixo). Contadores zeram
+a cada quadro e o pré-passe os soma (349 de 455 registros, 12453 índices, todos múltiplos de 3). O endereço do bloco
+muda entre execuções (0x139de5900 na play2/3, 0x13aca7000 na play4). Índice de 32 bits nos draws do G-buffer, que
+leem o bloco certo. Draw 38: slice de 240 índices (80 triângulos), contagem 6, 57 índices válidos no buffer (restos de
+quadros anteriores ou escrita além do reservado). O compute que perde 3 stores (`d819a639b6163f1f`) não roda no quadro.
+O VS do pré-passe passa `gl_VertexIndex` (com base vertex, como o VertexId do Maxwell no Ryujinx).
+
+dkb-recomp (teasergames, cópia do dkb-pc-recomp; GPL por causa do Eglantine): mesmo sintoma, resolvido rodando o
+geometry shader; o patch 0018 deles mostra que a ViewportMask 0 é como o passthrough descarta um triângulo.
+
+**Passthrough nativo na NVIDIA** (`TOTK_NATIVE_GS`, padrão 1): `vk_device.c` liga `VK_NV_geometry_shader_passthrough`
+e `VK_NV_viewport_array2` quando os dois existem; `gfx_shader_set_host` passa `native_gs` (entra na identidade do cache,
+"nativegs") e o tradutor mantém o passthrough e a máscara. Assim o warp do geometry shader é o do Maxwell e os
+triângulos com máscara 0 somem também do pré-passe. Sem as extensões continua a emulação. `vk_pipeline.c` não acrescenta
+saídas a um geometry passthrough (as entradas dele são o que o fragment recebe). SPIR-V nativo validado offline.
+**play5**: primeira execução com isso ("geometry passthrough native" no log). G-buffer igual (fragmentado): não era o
+agrupamento dos warps. Pré-passe com profundidade completa: o jogo não zera a máscara.
+
+**play6** (`TOTK_GS_CULL_FLIP=1`, diagnóstico em `vk_pipeline.c`, desligado por padrão: troca o único
+`OpFOrdLessThanEqual` do geometry shader, o teste de costas, por `>=`): G-buffer quase vazio, só faces de costas e
+lascas. O sentido do teste está certo.
+
+**play7/play8** (`TOTK_DUMP_PASS=sh:e7387271d2011656`, os 12 draws de pele do pré-passe; `vk_dump.c` agora copia os
+SSBOs do estágio geometry): base vertex 0, índices de 16 bits, slice do tamanho exato do draw. Comparando os
+triângulos originais com o que o geometry shader gravou: só 4-5% contados (draw 13: 37 de 866; 14: 32 de 574; 18: 22 de
+516), quase todos válidos, mas alguns misturam índices de triângulos diferentes (`(4209, 4210, 2657)`: as lascas), e há
+valores depois da contagem (restos ou escrita além do reservado). Locations batem (GS lê outcodes na 2 e pixels na 1,
+como o VS escreve). Barreira entre passes é completa (`barrier_to`, ALL_COMMANDS). Conclusão parcial: ou o teste de
+visibilidade recebe valores diferentes do Switch, ou a compactação (ballot/shuffle-up/atomic) diverge; os triângulos
+misturados apontam para a compactação.
+
+hwaoi-recomp (Alano6678, derivado do DKB, GPL): não resolveu; terreno ainda preto, contorno grava os registros pela CPU.
+
+**Correção (play9): o geometry shader de culling é trocado por um que lista todos os triângulos.**
+`runtime/shaders/mua3_list_tris.geom` (compilado por `tools/build_shaders.py`, que agora aceita `.geom`, para
+`runtime/mua3_list_tris_spv.h`): para cada triângulo, `atomicAdd(registro, 3)` e os 3 índices (o `gl_VertexIndex` que o
+VS põe na location 0), mais a emissão do triângulo com a location 0 repassada ao fragment do pré-passe. Mesmos bindings da
+tradução do shader do jogo (1 registro, 2 lista, 3 c0, com o desvio de alinhamento lido de c0+0x410/0x420).
+`vk_exec_draw.c` `gs_list_all` reconhece o shader do jogo (estágio geometry, exatamente dois SSBOs gravados em
+c0+0x410/0x420, sem texturas/imagens) e usa o nosso no lugar, só no MUA3; `TOTK_GS_LIST_ALL=0` volta ao do jogo.
+Custo: o G-buffer desenha também o que o culling descartaria (o teste de profundidade EQUAL deixa os pixels iguais).
+
+Resultado (F7, quadro 2734, `build\upd\dump_list`): **G-buffer completo** (passe 27: albedo 95885 cores distintas,
+normais 507113; antes 16593 e 41273) e **quadro final com a cena inteira** pela primeira vez: hangar Kree, Drax,
+Star-Lord, Groot e Rocket, HUD e diálogo. Pendente: a iluminação puxa muito para o ciano (ver se é luz, exposição ou
+bloom); a causa de o shader do jogo contar só 5% continua desconhecida (contorno, não conserto).
+
+**Ciano (play9-11).** Referência (vídeo do jogo na nave Kree): ambiente azul-petróleo escuro, personagens com cor. Na
+play9 (diálogo da Gamora, câmera sobre o piso de painéis luminosos) o chão sai ciano estourado e os personagens
+acinzentados; o t3 do G-buffer (luz acumulada, r11g11b10f) já tem o chão claro (máx. 4,6/20/16,5) e os personagens em
+vermelho puro. `vk_dump.c` escreve "buffer texture (zero view bound)" para toda buffer texture (só um rótulo); o log
+mostra que elas são ligadas. `TOTK_TEXBUF=all` (play10) não travou o carregamento; a chegada ("KREE SHIP") ficou parecida
+com a referência. Com a regra padrão (play11, fala do Drax logo depois) também ficou: iluminação escura e personagens
+com cor. Então `TOTK_TEXBUF` não é a causa e fica como está. Pendente: comparar o ponto da play9 com uma referência do
+mesmo lugar; o vermelho puro dos personagens no t3 pode ser máscara do jogo.
+
 ## Próximos marcos
 
 1. (feito na rodada 4) Reproduzir o vídeo sob demanda e descobrir por que o quadro decodificado não aparece (o jogo usa

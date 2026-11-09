@@ -921,7 +921,7 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 
 static VkShaderStageFlags stage_bit(int stage) {
     return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
-                                                                                      : VK_SHADER_STAGE_COMPUTE_BIT;
+         : stage == GFX_STAGE_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -980,11 +980,13 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
     return -1;
 }
 
-// Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
+// Checks the stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
+// A geometry stage is in the shared set, its bindings moved past the vertex stage's (pipe_miss).
 static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off, char *why, size_t cap) {
     uint32_t nv = l->set1 ? l->n0 : l->n;
     int m = module_binding_missing(s->vs, l->b, nv, 0);
     const char *stage = "vertex";
+    if (m < 0 && s->gs) m = module_binding_missing(s->gs, l->b, l->n, binding_span(s->vs) - 1), stage = "geometry";
     if (m < 0 && s->fs) {
         m = l->set1 ? module_binding_missing(s->fs, l->b + l->n0, l->n - l->n0, 0) : module_binding_missing(s->fs, l->b, l->n, fs_off);
         stage = "fragment";
@@ -1211,7 +1213,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
 // ---- graphics pipelines
 
 typedef struct {                       // normalized: zero where the state is dynamic or unused
-    const GfxShader *vs, *fs;
+    const GfxShader *vs, *fs, *gs;
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
@@ -1269,8 +1271,8 @@ uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_w
 
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
-    k->vs = s->vs, k->fs = s->fs;
-    k->indep = (uint8_t)P.indep;
+    k->vs = s->vs, k->fs = s->fs, k->gs = s->gs;
+    k->indep = (uint8_t)(P.indep && !s->gs);   // a geometry stage always gets the shared layout (pipe_miss)
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
     int d, st;
@@ -1333,11 +1335,56 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+// True when the module declares capability cap (capabilities come first in a module).
+static int spirv_has_capability(const uint32_t *w, uint64_t n, uint32_t cap) {
+    for (uint64_t i = 5; w && i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n || op != 17) return 0;   // OpCapability
+        if (len >= 2 && w[i + 1] == cap) return 1;
+        i += len;
+    }
+    return 0;
+}
+
+// The Locations of `need` (the next stage's inputs, packed ones left out) that the producer's outputs `have` lack.
+static uint32_t missing_outputs(uint32_t need, const GfxShaderIo nin[32], uint32_t have, const GfxShaderIo pout[32],
+                                const char *producer, const char *consumer) {
+    uint32_t missing = 0;
+    for (int i = 0; i < 32; i++) {
+        if (!(need >> i & 1) || nin[i].packed) continue;
+        if (!(have >> i & 1)) missing |= 1u << i;
+        else if (pout[i].type != nin[i].type)
+            LOG_ONCE("vk_pipeline: varying %d is type %d in the %s stage, %d in the %s stage", i, pout[i].type, producer,
+                     nin[i].type, consumer);
+    }
+    return missing;
+}
+
+// A geometry stage (s->gs) sits between the vertex and fragment stages, always with the shared layout: its bindings
+// follow the vertex stage's (binding_span(s->vs) - 1 added) and fs_off covers both. The vertex stage gets the outputs
+// the geometry stage reads and lacks, the geometry stage those the fragment stage reads and lacks, each initialised to
+// (0, 0, 0, 1) as Maxwell reads an unwritten attribute.
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
-    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
-    uint64_t vw, fw;
-    const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
-    uint32_t *vpatched = NULL, *fpatched = NULL;
+    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
+    uint64_t vw, fw, gw = 0;
+    const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw), *gcode = NULL;
+    uint32_t *vpatched = NULL, *fpatched = NULL, *gpatched = NULL;
+    if (s->gs) {
+        GfxShaderIo gin[32], vout[32];
+        uint32_t missing = missing_outputs(gfx_shader_inputs(s->gs, gin), gin, gfx_shader_outputs(s->vs, vout), vout,
+                                           "vertex", "geometry");
+        if (missing) {
+            uint64_t n2 = 0;
+            vpatched = spirv_add_outputs(vcode, vw, missing, gin, &n2);
+            if (!vpatched) LOG_ONCE("vk_pipeline: cannot add vertex outputs the geometry stage reads (mask %#x)", missing);
+            else vcode = vpatched, vw = n2;
+        }
+        gcode = gfx_shader_spirv(s->gs, &gw);
+    }
+    // A native passthrough geometry stage (VK_NV_geometry_shader_passthrough) forwards its passthrough inputs as they
+    // are and may not declare per-vertex outputs of its own, so it gets none added below.
+    enum { CAP_GEOMETRY_SHADER_PASSTHROUGH_NV = 5251 };
+    const int gs_passthrough = gcode && spirv_has_capability(gcode, gw, CAP_GEOMETRY_SHADER_PASSTHROUGH_NV);
     if (l->set1) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
@@ -1349,15 +1396,21 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         }
     }
     if (s->fs) {
-        GfxShaderIo fin[32], vout[32];
-        uint32_t need = gfx_shader_inputs(s->fs, fin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
-        for (int i = 0; i < 32; i++) {
-            if (!(need >> i & 1) || fin[i].packed) continue;
-            if (!(have >> i & 1)) missing |= 1u << i;
-            else if (vout[i].type != fin[i].type)
-                LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
-        }
-        if (missing && !l->set1) {
+        GfxShaderIo fin[32], pout[32];
+        const GfxShader *feeder = s->gs ? s->gs : s->vs;   // the stage whose outputs the fragment stage reads
+        uint32_t need = gfx_shader_inputs(s->fs, fin);
+        // a passthrough geometry stage hands on its inputs: those are what the fragment stage can read
+        uint32_t have = gs_passthrough ? gfx_shader_inputs(s->gs, pout) : gfx_shader_outputs(feeder, pout);
+        uint32_t missing = missing_outputs(need, fin, have, pout, s->gs ? "geometry" : "vertex", "fragment");
+        if (missing && gs_passthrough) {
+            LOG_ONCE("vk_pipeline: the fragment stage reads varyings %#x that the passthrough geometry stage does not "
+                     "forward; they are undefined", missing);
+        } else if (missing && s->gs && gcode) {
+            uint64_t n2 = 0;
+            gpatched = spirv_add_outputs(gcode, gw, missing, fin, &n2);
+            if (!gpatched) LOG_ONCE("vk_pipeline: cannot add missing geometry outputs (mask %#x)", missing);
+            else gcode = gpatched, gw = n2;
+        } else if (missing && !l->set1) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
@@ -1378,19 +1431,45 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
         if (fcode) fm = make_module(fcode, fw);
     }
+    if (s->gs && gcode) {
+        uint32_t *r = spirv_rebind(gcode, gw, binding_span(s->vs) - 1);
+        // Diagnostic, TOTK_GS_CULL_FLIP=1 (off by default): every OpFOrdLessThanEqual of a geometry shader becomes
+        // OpFOrdGreaterThanEqual. MUA3's culling geometry shader has one, its back-face test (cull when the screen-space
+        // cross product is <= 0); flipping it shows whether the test sees the triangles' winding mirrored.
+        static int flip = -1;
+        if (flip < 0) flip = rt_knob("GS_CULL_FLIP", "0");
+        for (uint64_t i = 5; flip && r && i < gw;) {
+            enum { OP_FORD_LESS_THAN_EQUAL = 188, OP_FORD_GREATER_THAN_EQUAL = 190 };
+            uint32_t len = r[i] >> 16;
+            if (!len) break;
+            if ((r[i] & 0xffff) == OP_FORD_LESS_THAN_EQUAL) r[i] = len << 16 | OP_FORD_GREATER_THAN_EQUAL;
+            i += len;
+        }
+        if (flip) LOG_ONCE("vk_pipeline: TOTK_GS_CULL_FLIP: geometry shader <= comparisons turned into >=");
+        if (r) gm = make_module(r, gw);
+        free(r);
+    }
     vm = make_module(vcode, vw);
-    free(vpatched), free(fpatched);
+    free(vpatched), free(fpatched), free(gpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm)) goto out;
+    if (!vm || (s->fs && !fm) || (s->gs && !gm)) goto out;
 
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"},
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"}};
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
-    uint64_t sw;
-    const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    pin_subgroup32(&stages[0], &rqv, scode, sw);
-    if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
+    // Vertex, then geometry and fragment when present; each pinned to 32 lanes where it uses subgroup operations.
+    VkPipelineShaderStageCreateInfo stages[3];
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[3];
+    const GfxShader *sh[3] = {s->vs, s->gs, s->fs};
+    const VkShaderModule mod[3] = {vm, gm, fm};
+    const VkShaderStageFlagBits bit[3] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    uint32_t nst = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!sh[i]) continue;
+        stages[nst] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                        .stage = bit[i], .module = mod[i], .pName = "main"};
+        uint64_t sw;
+        const uint32_t *scode = gfx_shader_spirv(sh[i], &sw);   // the unpatched words: patched copies are freed by now
+        pin_subgroup32(&stages[nst], &rq[nst], scode, sw);
+        nst++;
+    }
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -1443,7 +1522,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .stageCount = s->fs ? 2 : 1, .pStages = stages, .pVertexInputState = &vi,
+                                       .stageCount = nst, .pStages = stages, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout};
@@ -1461,6 +1540,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
 out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
     if (fm) vkDestroyShaderModule(P.device, fm, NULL);
+    if (gm) vkDestroyShaderModule(P.device, gm, NULL);
     return pipe;
 }
 
@@ -1856,7 +1936,7 @@ static struct {
 // built the pipeline and appended by the present thread (vk_pipeline_autosave) or at exit (vk_pipeline_save). A file
 // with another magic, version or record size is ignored and rewritten. Bump KEYS_VERSION when VkPipeState or the
 // record changes meaning without changing size.
-#define KEYS_VERSION 3                 // 3: shaders named by input id (gfx_shader.c)
+#define KEYS_VERSION 4                 // 3: shaders named by input id (gfx_shader.c); 4: VkPipeState.gs
 typedef struct { char magic[8]; uint32_t version, rec_size; } KeysHeader;
 typedef struct {
     uint8_t vs[32], fs[32];            // gfx_shader_input_id of each stage; fs all zero with has_fs 0
@@ -1916,14 +1996,15 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
     if (s->fs) memcpy(r->fs, gfx_shader_input_id(s->fs), 32), r->has_fs = 1;
     r->s = *s;
-    r->s.vs = r->s.fs = NULL;
+    r->s.vs = r->s.fs = r->s.gs = NULL;
     r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
     r->s.alpha_ref = 0;      // part of the fragment shader's input id already
 }
 
-// A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
+// A pipeline was built for a draw: queue its record for the file. Caller holds P.lock. A record names the vertex and
+// fragment shaders only, so pipelines with a geometry stage are left out: the prebuild would make them without it.
 static void keys_note(const VkPipeState *s) {
-    if (!A.on || !K.path[0]) return;
+    if (!A.on || !K.path[0] || s->gs) return;
     static const uint8_t none[32];
     if (s->fs && !memcmp(gfx_shader_input_id(s->fs), none, 32)) return;   // the runtime's own shader (gfx_shader_own)
     KeyRec r;
@@ -2167,9 +2248,22 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     Bindings B = {0};
     Layout *l = NULL;
     uint32_t span = binding_span(s->vs);
-    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
+    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) ||
+        (s->gs && gfx_shader_stage(s->gs) != GFX_STAGE_GS))
+        why = "stage mismatch";
     else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
-    else if (P.indep) {
+    else if (s->gs) {
+        // A geometry stage: one shared set (vertex, then geometry, then fragment bindings), whatever P.indep says.
+        // Stage-independent layouts and the pipeline libraries cover the vertex and fragment stages only, so such a
+        // pipeline is always a monolithic build (gpl_link declines a layout without set 1).
+        uint32_t gspan = binding_span(s->gs);
+        if (!add_stage(&B, s->vs, 0) || !add_stage(&B, s->gs, span - 1) || (s->fs && !add_stage(&B, s->fs, span + gspan - 2)))
+            why = "too many bindings";
+        else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+        span += gspan - 1;
+        static int said;
+        if (!why && !said++) rt_log("vk_pipeline: first pipeline with a geometry stage (shared layout, %u bindings)", B.n);
+    } else if (P.indep) {
         Bindings F = {0};
         if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
         else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";

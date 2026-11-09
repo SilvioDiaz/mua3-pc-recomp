@@ -6,7 +6,8 @@
 //   totk_xlate --serve              one request per stdin line: {"job": {...}, "out": "<dir>"}; one reply line per request:
 //                                   "ok <key>" or "fail <key> <message>"; a malformed line gets "fail ? <message>" and the loop continues.
 //   totk_xlate <jobs.json> <outdir> batch mode: a JSON array of jobs, prints a summary, exit 1 if any failed.
-//   job: { "key", "stage": "vs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
+//   job: { "key", "stage": "vs|gs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
+//          "topology": n (gs only: Ryujinx InputTopology of the draw),
 //          "tex": {slot: type}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool,
 //          "sbuf_align": int, "subgroup": int }
@@ -110,11 +111,23 @@ static class SwshXlate
             // discards in the shader when the output alpha of target 0 fails the comparison.
             AlphaTestOp alphaOp = _job["alpha_test"] is JsonNode at && (int)at >= 1 && (int)at <= 7 ? (AlphaTestOp)(int)at : AlphaTestOp.Always;
             float alphaRef = _job["alpha_ref_bits"] is JsonNode ar ? BitConverter.UInt32BitsToSingle((uint)ar) : 0f;
-            return new GpuGraphicsState(earlyZ, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            // "topology": a geometry shader's input primitive, Ryujinx InputTopology (0 points, 1 lines, 2 lines
+            // adjacency, 3 triangles, 4 triangles adjacency), from the draw (runtime/vk_exec_draw.c gs_topology). The
+            // SPIR-V declares it and Vulkan requires it to match the draw. Other stages ignore it.
+            InputTopology topology = _job["topology"] is JsonNode tp && (int)tp >= 0 && (int)tp <= 4 ? (InputTopology)(int)tp : InputTopology.Triangles;
+            return new GpuGraphicsState(earlyZ, topology, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, depthMinusW, false, 1f, alphaOp, alphaRef, attr, false, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
         public bool QueryHostSupportsDepthClipControl() => true;
+        // "native_gs": true when the runtime enabled NVIDIA's VK_NV_geometry_shader_passthrough and VK_NV_viewport_array2
+        // (runtime/vk_device.c, TOTK_NATIVE_GS). A passthrough geometry shader (SPH GpPassthrough, no OUT instruction) then
+        // stays one and keeps its ViewportMask writes, as Maxwell runs it: MUA3's depth prepass culls with the mask (0
+        // drops the primitive) and compacts the survivors with warp operations, which assume Maxwell's warps. Without
+        // them Ryujinx writes the emit loop itself (EmitterContext.PrepareForVertexReturn) and drops the mask writes.
+        bool NativeGs => _job["native_gs"] is JsonValue ng && ng.TryGetValue<bool>(out bool nb) && nb;
+        public bool QueryHostSupportsGeometryShaderPassthrough() => NativeGs;
+        public bool QueryHostSupportsViewportMask() => NativeGs;
         // Vulkan: the ConstOffset / ConstOffsets image operands Ryujinx emits must be constants. A TLD4.PTP whose offsets
         // come from registers (agl_technique_pfx compute b940aa86, dfe7662f) otherwise becomes an OpConstantComposite over
         // computed ids, which spirv-val rejects; false makes TexturePass emulate only non-constant offsets.

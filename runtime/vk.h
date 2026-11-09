@@ -36,7 +36,10 @@ typedef struct VkCtx {
         has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints (TOTK_PASS_CRUMBS=1, vk_crumbs.c)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
-        has_hdr_metadata;                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
+        has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
+        has_gs_passthrough,                 // VK_NV_geometry_shader_passthrough + VK_NV_viewport_array2: passthrough
+                                            // geometry shaders stay passthrough, as Maxwell runs them (TOTK_NATIVE_GS)
+        has_viewport_array2;
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -476,6 +479,8 @@ void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem
 // vk_pipeline_set_dynamic only and left out of the pipeline key.
 typedef struct VkPipeState {
     const GfxShader *vs, *fs;              // gfx_shader_get results; fs NULL: no fragment stage (depth only)
+    const GfxShader *gs;                   // geometry stage, NULL without one; such pipelines use one shared descriptor
+                                           // set and no pipeline libraries (vk_pipeline.c pipe_miss)
     int32_t color_fmt[8];                  // NVNformat of colour target i (OP_SET_RT), 0 none
     int32_t depth_fmt;                     // NVNformat of the depth/stencil target, 0 none
     uint8_t samples;                       // sample count of the targets; 0 or 1 single-sampled

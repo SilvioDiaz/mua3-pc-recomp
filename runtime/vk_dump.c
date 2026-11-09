@@ -786,7 +786,9 @@ static void flush_luts(VkExec *ex, int n) {
     nluts = 0;
 }
 
-static int nvn_stage(int gfx_stage) { return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_FS ? 1 : 5; }
+static int nvn_stage(int gfx_stage) {
+    return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_FS ? 1 : gfx_stage == GFX_STAGE_GS ? 2 : 5;
+}
 
 static const char *decl_type(uint16_t t, char tmp[24]) {
     static const char *base[] = {"?", "1D", "buffer", "2D", "3D", "cube"};
@@ -808,7 +810,7 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
-    static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    static const char *stn[6] = {"vs", "fs", "gs", "?", "?", "cs"};
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
         const GfxShaderRes *r = bd->res;
@@ -1140,8 +1142,8 @@ void vk_dump_draw_done(VkExec *ex, const char *what, uint64_t ibuf, uint64_t iby
             why = copy_buffer(ex, ind, ind_bytes, file, &got);
             bin_note(draws_f, file, why, got, ind_bytes);
         }
-        static const char *stn[2] = {"vs", "fs"};
-        for (int st = 0; st < 2; st++)
+        static const char *stn[3] = {"vs", "fs", "gs"};   // NVN stages 0-2: a geometry stage's stores land here too
+        for (int st = 0; st < 3; st++)
             for (int k = 0; k < 16; k++) {
                 const p_bind_buf *b = &ex->ssbo[st][k];
                 if (!b->addr) continue;

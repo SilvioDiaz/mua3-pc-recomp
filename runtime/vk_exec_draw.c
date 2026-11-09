@@ -40,6 +40,7 @@
                               // 1408 pcss and 1424 shadow_spread (translator patches 0010, 0011), 1440 HDR (support_fill)
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
+#define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
@@ -113,11 +114,11 @@ static struct {
     VkBuffer sup_buf;
     VkDeviceSize sup_off;
     int sup_valid;
-    uint8_t c0[3][VK_C0_BYTES];          // last c0 bank per stage (vertex, fragment, compute) and where it lives
-    VkBuffer c0_buf[3];
-    VkDeviceSize c0_off[3];
-    int c0_valid[3];
-    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[3];   // what vk_c0_fill read for c0[k]
+    uint8_t c0[4][VK_C0_BYTES];          // last c0 bank per stage (vertex, fragment, compute, geometry) and where it lives
+    VkBuffer c0_buf[4];
+    VkDeviceSize c0_off[4];
+    int c0_valid[4];
+    struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[4];   // what vk_c0_fill read for c0[k]
     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
@@ -661,6 +662,41 @@ static inline const prog_t *prog_of(const VkExec *ex, int st) {
     return p ? p : ex->prog;
 }
 
+// Logs a bound program that holds a geometry or tessellation shader (NVN stages 2 to 4). Geometry shaders are replayed
+// (prepare_draw); tessellation stages are not translated, so whatever they would have drawn or written is lost. In DKB
+// Recomp the counts of indirect draws came from a geometry stage, which left the records at {0, 1, 0, 0, 0}, the state
+// MUA3's G-buffer draws showed before geometry shaders ran; MUA3's one geometry shader in Ryujinx's cache emits no
+// vertex and stores to global memory three times. The first 32 programs get a line each.
+static void note_unreplayed_stages(const prog_t *p, uint32_t bind_mask) {
+    static const char *const names[6] = {"vertex", "fragment", "geometry", "tess control", "tess eval", "compute"};
+    static uint64_t seen[32];
+    static int nseen;
+    static int64_t total;
+    if (!p->serial) return;
+    for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
+        const uint8_t *c = p->sd[i].control;
+        if (!c || !p->sd[i].data) continue;
+        uint32_t st, len;
+        memcpy(&st, c + 0x714, 4);
+        if (st < 2 || st > 4) continue;
+        for (int k = 0; k < nseen; k++)
+            if (seen[k] == p->serial) return;
+        total++;
+        if (nseen >= 32) {
+            if (!(total & (total - 1)))
+                rt_log("vk_exec: %lld binds of programs with unreplayed stages so far (the first 32 are named)",
+                       (long long)total);
+            return;
+        }
+        seen[nseen++] = p->serial;
+        memcpy(&len, c + 0x704, 4);
+        rt_log("vk_exec: program %p (bind mask %#x) has a %s shader (code %#llx, %u bytes), which the replay %s",
+               (const void *)p, bind_mask, names[st], (unsigned long long)p->sd[i].data, len,
+               st == NVN_STAGE_GS ? "runs" : "skips");
+        return;
+    }
+}
+
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
 // was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
 // otherwise (slot_still).
@@ -710,11 +746,26 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
     return h && vk_texture_buffer_locked((int)(h & 0xfffff), &addr, &fmt, &n) ? GFX_TEX_BUFFER : 0;
 }
 
+static uint8_t sf_gs_topo;   // shader_for: the geometry stage's input primitive (gs_topology of the draw)
+
+// Ryujinx InputTopology + 1 (GfxShaderAnswers.gs_topo) of an NVN draw primitive: what a geometry shader receives.
+// Strips, fans, loops, quads and polygons arrive as their base primitive, as Vulkan assembles them.
+static uint8_t gs_topology(int prim) {
+    switch (prim) {
+    case NVN_DRAW_PRIMITIVE_POINTS: return 1;
+    case NVN_DRAW_PRIMITIVE_LINES: case NVN_DRAW_PRIMITIVE_LINE_LOOP: case NVN_DRAW_PRIMITIVE_LINE_STRIP: return 2;
+    case NVN_DRAW_PRIMITIVE_LINES_ADJACENCY: case NVN_DRAW_PRIMITIVE_LINE_STRIP_ADJACENCY: return 3;
+    case NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY: case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP_ADJACENCY: return 5;
+    default: return 4;
+    }
+}
+
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
 static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
+    else if (st == NVN_STAGE_GS) a->gs_topo = sf_gs_topo;
     else
         for (int k = 0; k < 3; k++) {
             uint32_t l;
@@ -775,10 +826,11 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
             return set[0].s;
         }
     }
-    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
-    const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
-                       : pending && (vk_pipeline_async_on() || a.mvprev) ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
-                                                           : gfx_shader_get(gs, ctl, code, len, NULL, &a);
+    int gst = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : st == NVN_STAGE_GS ? GFX_STAGE_GS
+            : GFX_STAGE_CS;
+    const GfxShader *s = await ? gfx_shader_await(gst, ctl, code, len, &a)
+                       : pending && (vk_pipeline_async_on() || a.mvprev) ? gfx_shader_get_async(gst, ctl, code, len, &a, pending)
+                                                           : gfx_shader_get(gst, ctl, code, len, NULL, &a);
     if (pending && *pending) return NULL;
     if (s) slot_mask_learn(serial, st, s);
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
@@ -793,7 +845,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
 // ---- descriptors
 
 static int nvn_stage_of(int gfx_stage) {
-    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS : NVN_STAGE_CS;
+    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS
+         : gfx_stage == GFX_STAGE_GS ? NVN_STAGE_GS : NVN_STAGE_CS;
 }
 
 static VkDescriptorBufferInfo zero_info(uint64_t max) {
@@ -851,8 +904,16 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
     }
 }
 
+// The stage's storage-buffer table in c0: 0x110 + 0x100 * (Maxwell hardware stage - 1) for graphics, in the hardware
+// order VertexB 1, TessControl 2, TessEval 3, Geometry 4, Fragment 5 (vertex 0x110 and fragment 0x510 are confirmed on
+// TotK and MUA3; geometry 0x410 follows the order and is not yet seen in a MUA3 log), 0x310 for compute. -1: none.
+static int c0_ssbo_base(int stage) {
+    return stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_GS ? 0x410 : stage == NVN_STAGE_FS ? 0x510
+         : stage == NVN_STAGE_CS ? 0x310 : -1;
+}
+
 // The driver constant bank c0 as GLSLC-compiled shaders read it. Storage-buffer tables {u64 address, u32 size} every
-// 16 bytes at 0x110 (vertex), 0x510 (fragment), 0x310 (compute): Ryujinx's GlobalToStorage fallback loads each
+// 16 bytes at c0_ssbo_base (vertex 0x110, geometry 0x410, fragment 0x510, compute 0x310): Ryujinx's GlobalToStorage fallback loads each
 // candidate base from here and compares the global pointer against it. Compute: dispatch size at 0x200, the uniform
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
 // 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
@@ -860,7 +921,7 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     memset(bank, 0, VK_C0_BYTES);
-    int base = stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_FS ? 0x510 : stage == NVN_STAGE_CS ? 0x310 : -1;
+    int base = c0_ssbo_base(stage);
     if (base < 0) return;
     c0_table(bank + base, ssbo);
     if (stage == NVN_STAGE_CS) {
@@ -883,7 +944,7 @@ static int c0_on(void) {   // TOTK_FIX_C0=0: c0 reads zeros instead of the drive
 
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
 static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
-    int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+    int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : st == NVN_STAGE_GS ? 3 : 2;
     // vk_c0_fill reads the storage slots, and the uniform slots and dispatch size for compute or the base instance for
     // graphics: equal inputs give the same bank, so neither the fill nor the 2 KiB compare is needed.
     typeof(B.c0_in[0]) in;
@@ -955,14 +1016,15 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 
 // The NVN slot of a storage binding. Ryujinx numbers a shader's storage buffers in the order it meets them
 // (GfxShaderRes.slot); the NVN slot is the entry of the driver constant buffer c0 that holds the buffer's address
-// (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment) and 0x310 (compute).
+// (cbuf_slot 0, handle = word offset): 16-byte entries from c0_ssbo_base (vertex 0x110, geometry 0x410, fragment
+// 0x510, compute 0x310).
 // A compute address at c0 0x210..0x30f is uniform block (offset - 0x210) / 16 read as storage: *ubo is set. -1: the
 // address is not in c0 (the shader loads it from a user uniform block: ubo_ptr) or the stage has no known table.
 // Mapping: MacNativeGames games/totk/tools/totk_xlate/Service.cs:206-222 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou).
 static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     *ubo = 0;
     if (r->cbuf_slot != 0) return -1;
-    int off = r->handle * 4, base = st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310 : -1;
+    int off = r->handle * 4, base = c0_ssbo_base(st);
     if (st == NVN_STAGE_CS && off >= 0x210 && off < 0x310 && (off - 0x210) % 16 == 0) {
         *ubo = 1;
         return (off - 0x210) / 16;
@@ -2282,6 +2344,52 @@ static int pipe_memo_on(void) {
     return PM.on;
 }
 
+// ---- MUA3's culling geometry shader
+// MUA3's depth prepass binds a passthrough geometry shader that tests each triangle (outside the view, back-facing, too
+// small), counts the survivors per warp (ballot, shuffle prefix sum, one atomic per warp) and writes their vertex
+// indices to a per-draw list that the G-buffer pass then draws with DrawElementsIndirect. Replayed on Vulkan it lists
+// only 4-5% of each mesh's triangles and mixes a few up (docs/mua3-port.md, round 13), so the G-buffer came out in
+// shards. It is recognised by its resources (a geometry stage with exactly two written storage buffers at c0+0x410 and
+// c0+0x420 and no textures or images) and replaced by shaders/mua3_list_tris.geom, which lists every triangle with one
+// atomic each. TOTK_GS_LIST_ALL=0 keeps the game's shader.
+#include "mua3_list_tris_spv.h"
+static const char GS_LIST_RES[] = "{\"key\":\"mua3_list_tris\",\"stage\":\"gs\",\"notes\":[],\"cbufs\":[{\"binding\":3,\"slot\":0}],"
+                                  "\"sbufs\":[{\"binding\":1,\"slot\":0,\"cb_slot\":0,\"cb_offset\":260,\"flags\":1},"
+                                  "{\"binding\":2,\"slot\":1,\"cb_slot\":0,\"cb_offset\":264,\"flags\":1}],"
+                                  "\"textures\":[],\"images\":[]}";
+
+static int is_mua3_cull_gs(const GfxShader *s) {
+    const GfxShaderRes *r;
+    if (gfx_shader_stage(s) != GFX_STAGE_GS || gfx_shader_resources(s, GFX_RES_TEX, &r) ||
+        gfx_shader_resources(s, GFX_RES_IMG, &r) || gfx_shader_resources(s, GFX_RES_SSBO, &r) != 2)
+        return 0;
+    for (int i = 0; i < 2; i++)
+        if (r[i].cbuf_slot != 0 || !(r[i].flags & 1) || (r[i].handle * 4 != 0x410 && r[i].handle * 4 != 0x420)) return 0;
+    return r[0].handle != r[1].handle;
+}
+
+// The geometry shader a draw runs: gs itself, or the list-everything stand-in for MUA3's culling shader. The last
+// answer is kept, since a frame binds the same shader for hundreds of prepass draws. Replay thread only.
+static const GfxShader *gs_list_all(const GfxShader *gs) {
+    static int on = -1;
+    static const GfxShader *own, *last_in, *last_out;
+    if (on < 0) {
+        on = RT_MUA3 && rt_knob("GS_LIST_ALL", "1");
+        if (on) {
+            own = gfx_shader_own(mua3_list_tris_spv, sizeof mua3_list_tris_spv / 4, GS_LIST_RES);
+            if (!own) on = 0, rt_log("vk_exec: the triangle list geometry shader is malformed: the game's culling shader runs");
+        }
+    }
+    if (!on || !gs) return gs;
+    if (gs == last_in) return last_out;
+    last_in = gs, last_out = is_mua3_cull_gs(gs) ? own : gs;
+    if (last_out == own) {
+        static int said;
+        if (!said++) rt_log("vk_exec: MUA3's culling geometry shader is replaced by one that lists every triangle (TOTK_GS_LIST_ALL=0 keeps it)");
+    }
+    return last_out;
+}
+
 // A draw prepare_draw drops: counted per pass in a frame dump (vk_dump_dropped). Returns 0 for the callers.
 #define DROP(why) (vk_dump_armed ? vk_dump_dropped(why) : (void)0, 0)
 
@@ -2331,10 +2439,23 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
     if (!vs || (has_fs && !fs)) return DROP(VK_DROP_SHADER_FAILED);
+    // The geometry stage, when the program has one. Looked up on every draw (the shader memo holds the vertex and
+    // fragment stages only); find_stage returns at once for the programs without one. Its translation depends on the
+    // draw's primitive (gs_topology). A pending one waits or skips like the other stages.
+    int has_gs, gs_wait = 0;
+    sf_gs_topo = gs_topology(prim);
+    const GfxShader *gs = shader_for(ex, NVN_STAGE_GS, &has_gs, &gs_wait, 0);
+    if (gs_wait) {
+        if (oneshot < 0) oneshot = !vk_exec_targets_recent(ex, skip >= 1);
+        if (!oneshot) return perf_count(PERF_CNT_SHADER_SKIP), DROP(VK_DROP_SHADER_PENDING);
+        gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
+    }
+    if (has_gs && !gs) return DROP(VK_DROP_SHADER_FAILED);
+    gs = gs_list_all(gs);
     if (vk_dlaa_skip_draw(ex, fs)) return DROP(VK_DROP_DLAA);   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
-    s.vs = vs, s.fs = fs;
+    s.vs = vs, s.fs = fs, s.gs = gs;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
@@ -2411,7 +2532,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
-    if (!ex->pass_stores && (shader_stores(vs) || shader_stores(fs))) ex->pass_stores = 1;
+    if (!ex->pass_stores && (shader_stores(vs) || shader_stores(fs) || shader_stores(gs))) ex->pass_stores = 1;
     bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
@@ -2857,6 +2978,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT || B.st.samples > 1 || B.st.raster_discard)
         return;
+    if (B.st.gs) return;   // the redraw has no geometry stage, so it would not cover what the original drew
     // solid geometry only, which tests and writes the scene depth: effects, particles and screen quads write none, and
     // drawn again they would put their motion on the surfaces behind them (DLSS takes those from the surface)
     if (!B.st.ds.dt || !B.st.ds.dw) return;
@@ -2979,7 +3101,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
         return;
     }
     VkPipeState ms = B.st;
-    ms.vs = vs, ms.fs = fs, ms.feedback = 0;
+    ms.vs = vs, ms.fs = fs, ms.gs = NULL, ms.feedback = 0;   // mvobj_draw_ lists no draw with a geometry stage
     memset(ms.color_fmt, 0, sizeof ms.color_fmt);
     ms.color_fmt[0] = NVN_FORMAT_RG16F;
     // blending off (blend_en below); the factors stay the game's, valid NVN values
@@ -3443,6 +3565,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
         if (!mask || mask == NVN_SHADER_STAGE_BITS_LARGE) mask = 0x3f;
         for (int st = 0; st < 6; st++)
             if (mask & (1u << st)) ex->stage_prog[st] = b->prog;
+        if (b->prog) note_unreplayed_stages(b->prog, (uint32_t)b->stages);
         if (b->prog) ex->prog = b->prog, ex->prog_unbound &= ~mask;
         else {
             static int said;
