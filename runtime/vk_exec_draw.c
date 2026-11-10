@@ -3484,6 +3484,22 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
         VkMemSpan ip;
         if (!vk_mem_resolve(d->ind, sizeof(VkDrawIndirectCommand), &ip) || ip.offset % 4)
             return warn_once(W_INDIRECT, "indirect draw arguments at %#llx are not backed or not aligned: draws skipped", (unsigned long long)d->ind);
+        if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && !ip.alloc) {
+            // No quad topology here, and an indirect draw cannot have its vertices regrouped on the GPU: drawn as the
+            // triangle list the pipeline has, every three vertices made a triangle across the quads (MUA3's beam and
+            // flash sprites turned into flat cones and shards). The arguments of these draws are written by the CPU
+            // next to the vertices, so they are read from pool storage and the draw goes through op_draw's quad
+            // rewrite. Arguments in device memory keep the indirect path below.
+            uint32_t a[4];
+            memcpy(a, (const void *)(uintptr_t)d->ind, sizeof a);
+            vk_mem_count(ip.cls, VK_MUSE_CPU_READ, sizeof a);
+            if (a[0] > (1u << 24) || a[1] > (1u << 20))
+                return warn_once(W_INDIRECT, "indirect quad draw with count %u instances %u: skipped", a[0], a[1]);
+            const p_draw q = {.prim = d->prim, .first = (int)a[2], .count = (int)a[0], .instances = (int)a[1],
+                              .base_instance = (int)a[3]};
+            op_draw(ex, &q);
+            return;
+        }
         if (!prepare_draw(ex, d->prim, 0x7fffffff, 0)) return;
         vk_exec_frame.draws++;
         VK_MEM_USE(ip);

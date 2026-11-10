@@ -472,6 +472,18 @@ visibilidade padrão pela lista global em ordem de carga (main primeiro), e só 
   **Confirmado pelo usuário:** na tela o brilho ficou como o do jogo original.
 - O rótulo do dump (`vk133 ... view-nvn-fmt 0x46`) mostra o formato da imagem, não o da view.
 
+## Rodada 18 (2026-11-10): cones e leques amarelos nos efeitos = quads em draw indireto
+
+- Sintoma (gravação de 47 s, luta na nave Kree): um clarão de tiro vira um leque de triângulos amarelos chapados e a
+  coluna de luz da troca de personagem vira um cone/trapézio de borda dura. Sem aviso no log.
+- `dump30_2` passe 62: 8 `DrawArraysIndirect prim 7` com o mesmo programa dos sprites de efeito (vs 5ae41460e09058fd,
+  fs 98dfc250723021ec, textura 32x128). Os argumentos ficam 0x20 bytes antes do vertex buffer (`0x13fab7620` /
+  `0x13fab7640`), ou seja, escritos pela CPU. `op_draw_idx_ind` mandava para `vkCmdDrawIndirect` como lista de
+  triângulos: vértices agrupados de 3 em 3 atravessando os quads.
+- Correção: `vk_exec_draw.c` `op_draw_idx_ind`, ramo DrawArraysIndirect: com quads e argumentos em memória legível
+  pela CPU, lê os 4 argumentos e desenha pelo `op_draw` (que reescreve quads em triângulos). Argumentos em memória de
+  dispositivo continuam no caminho indireto. **Compilado, falta confirmar jogando.**
+
 ## Desempenho com 60 fps (2026-11-10, play24)
 
 - Menus e cenas leves: 59-60 fps. Fases a ~48-56 fps; play22 (sem o cheat) ficava preso em 30.
@@ -494,7 +506,7 @@ referência: trava ~2 s depois do boot.
    2 texturas de 4 MiB reenviadas por quadro (~0,85 ms); a thread de render passa ~15 ms no fence. Ordem: (b) não
    reenviar texturas que só a GPU escreve, (a) devolver só o que a CPU lê, (c) fila de transferência separada.
 2. ~~Iluminação ciano~~: resolvida na rodada 17 (views sRGB), confirmada na play30.
-3. Causa real do geometry shader de culling contar só 5% (hoje contornado por `mua3_list_tris.geom`); quads em
-   draws indiretos.
+3. Causa real do geometry shader de culling contar só 5% (hoje contornado por `mua3_list_tris.geom`). Quads em
+   draws indiretos: feito na rodada 18 para DrawArraysIndirect com argumentos da CPU, a confirmar.
 4. Teste de cobertura pelo usuário: capítulos, vídeos, save/load, troca de personagens, DLC, dois controles.
 5. Levar ao cadence-recomp as correções gerais: ligação de símbolos do `loader.c`, mix por splitter, quads indexados.

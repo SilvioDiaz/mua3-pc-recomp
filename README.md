@@ -117,7 +117,8 @@ shaders (GPL code was only read for behaviour and rewritten, never copied).
 
 ## Building from source
 
-Windows only, game version **4.0.1** only (base game 1.0.0 + the 4.0.1 update). There is no installer or release yet.
+Windows only, game version **4.0.1** only (base game 1.0.0 + the 4.0.1 update). There is no installer yet; releases are
+source snapshots (no executable, since one would contain the game's code).
 
 Requirements: MSYS2 UCRT64 (clang/lld, ninja, SDL3, opus, libvpx, zstd, Vulkan headers), Python 3.12 and 3.14, the
 .NET SDK and Visual Studio Build Tools (for the shader translator), a GPU with Vulkan 1.3 and about 60 GB free.

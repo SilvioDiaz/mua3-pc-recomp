@@ -972,11 +972,16 @@ void fs_init(void) {
 }
 
 // ---- the RomFS interface (fs.h)
+static uint64_t io_calls, io_bytes, io_ns;   // romfs_read totals, counted under TOTK_TRACE=fs only
+
 void fs_trace(const char *what, const char *path) {
     static double t0;
     if (!(rt_trace & RT_TRACE_FS)) return;
     if (!t0) t0 = now_s();
-    rt_log("fs %8.3f %s %s", now_s() - t0, what, path ? path : "(null)");
+    // The RomFS read totals so far tell, between two lines, how much of the time went to the host's file reads.
+    rt_log("fs %8.3f %s %s (RomFS reads so far: %llu, %.1f MiB, %.1f ms)", now_s() - t0, what, path ? path : "(null)",
+           (unsigned long long)__atomic_load_n(&io_calls, __ATOMIC_RELAXED),
+           __atomic_load_n(&io_bytes, __ATOMIC_RELAXED) / 1048576.0, __atomic_load_n(&io_ns, __ATOMIC_RELAXED) / 1e6);
 }
 
 uint64_t romfs_file_count(void) { return file_count; }
@@ -1086,6 +1091,7 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
     if (!out || offset < 0 || !handle_source(h, &f, &base, &fsize)) return FS_R_INVALID;
     if ((uint64_t)offset > fsize || (!buffer && size)) return FS_R_INVALID;
     uint64_t n = size < fsize - (uint64_t)offset ? size : fsize - (uint64_t)offset, done = 0;
+    uint64_t t0 = rt_trace & RT_TRACE_FS ? plat_now_ns() : 0;
     if (f == image && image_map) {
         memcpy(buffer, image_map + base + (uint64_t)offset, (size_t)n);
         done = n;
@@ -1095,6 +1101,11 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
         int64_t r = read_at(f, (uint8_t *)buffer + done, chunk, base + (uint64_t)offset + done);
         if (r <= 0) rt_fatal("RomFS read failure at %#llx", (unsigned long long)(base + offset + done));
         done += (uint64_t)r;
+    }
+    if (t0) {
+        __atomic_fetch_add(&io_calls, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&io_bytes, done, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&io_ns, plat_now_ns() - t0, __ATOMIC_RELAXED);
     }
     *out = done;
     return 0;
