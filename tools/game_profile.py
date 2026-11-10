@@ -19,7 +19,8 @@ PROFILES = {
         'base_version': '1.0.0',
         'supported': ('1.2.1', '1.4.3', '1.1.0'),
         'modules': 'main,subsdk0,sdk',
-        'patches': True,                      # recomp/patches-v<version>.txt, cheats and ExeFS patches of mods
+        'table': 'patches-{tag}.txt',         # recomp/ code patch table per version (v121...), None without one
+        'patches': True,                      # cheats and ExeFS patches of mods
         'fonts': True,                        # the Switch shared fonts for Chinese and Korean text
         'prepare': True,                      # RomFS patches and the shader list (MacNativeGames)
         'dlss': True,                         # NVIDIA DLSS for the 3D scene (vk_dlaa.c)
@@ -35,6 +36,7 @@ PROFILES = {
         'base_version': '1.0.0',
         'supported': ('4.0.1',),
         'modules': 'main,subsdk0,subsdk1,sdk',
+        'table': 'patches-mua3-{tag}.txt',    # mua3fps60: the 60 FPS frame setup (runtime/cheats.c)
         'patches': False,
         'fonts': False,
         'prepare': False,
@@ -51,6 +53,7 @@ PROFILES = {
         'base_version': '1.0.0',
         'supported': ('1.5.0',),
         'modules': 'main,subsdk0,subsdk1,sdk',
+        'table': None,
         'patches': False,
         'fonts': False,
         'prepare': False,

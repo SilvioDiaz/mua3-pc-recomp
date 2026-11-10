@@ -41,8 +41,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
 import extract  # noqa: E402
 import ncz  # noqa: E402
 import shader_list  # noqa: E402
-from extract_exefs import (common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory,  # noqa: E402
-                           program_nca)
+from extract_exefs import common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory  # noqa: E402
+from game_profile import GAME  # noqa: E402
+from vendor_titles import program_nca  # noqa: E402   the profile's title ids, not only TotK's
+
+GAME_EXE = GAME['file'] + EXE   # the built game: totk.exe, cadence.exe
 
 GiB = 1 << 30
 DEST_EXTRA = 4 * GiB      # beside the RomFS: shader and pipeline caches (about 2 GB), exefs, totk.exe, seed files
@@ -187,7 +190,7 @@ def game_file(ctx, name):
 def game_version(ctx):
     """The update this install is built from: what the check identified, else the recorded one. An install made before
     1.4.3 support records no version, and that install is 1.2.1: name it here rather than leaning on SUPPORTED's order."""
-    return ctx.state.get('version', '1.2.1')
+    return ctx.state.get('version', '1.2.1' if GAME['game'] == 'totk' else SUPPORTED[0])
 
 
 def expected_update(ctx):
@@ -313,7 +316,7 @@ def shared_fonts_ready(dest):
 
 # ---- 1. check
 
-UPDATE_TITLE_ID = '0100F2C0115B6800'
+UPDATE_TITLE_ID = GAME['update_title']
 
 
 def base_misuse(records):
@@ -365,7 +368,7 @@ class Check(Step):
                 raise InstallError('check.firmware_missing', path=str(firmware))
             if not firmware_has_ncas(firmware):
                 raise InstallError('check.firmware_empty', path=str(firmware))
-        if lang in ini.NEED_SHARED_FONTS:
+        if GAME['fonts'] and lang in ini.NEED_SHARED_FONTS:
             if firmware is None:
                 rep.warning('warn.lang_needs_fonts', lang=lang)
             elif not shared_fonts_ready(dest):
@@ -615,7 +618,7 @@ class Check(Step):
             except ValueError:
                 raise InstallError('check.exefs_failed', input=name, log=str(logs / f'extract_exefs-{name}.log')) \
                     from None
-        problems = extract.exefs_problems(work / 'base' / 'exefs', versions['1.0.0'])
+        problems = extract.exefs_problems(work / 'base' / 'exefs', versions[GAME['base_version']])
         if problems:
             raise InstallError('check.base_wrong_version', modules=', '.join(problems))
         try:
@@ -814,8 +817,8 @@ EMITTED = re.compile(r'^emitted (\d+)/(\d+) chunks')
 DISCOVERED = re.compile(r'^(\w+): \d+ functions \(.*discovery')
 
 
-CHEAT_PLACES = ('cheats', 'atmosphere/contents/0100F2C0115B6000/cheats', 'contents/0100F2C0115B6000/cheats',
-                '0100F2C0115B6000/cheats')
+_T = GAME['base_title']
+CHEAT_PLACES = ('cheats', f'atmosphere/contents/{_T}/cheats', f'contents/{_T}/cheats', f'{_T}/cheats')
 
 
 def cheat_files(ctx):
@@ -824,21 +827,20 @@ def cheat_files(ctx):
     installed main, and the keys are computed before Extract runs (runner plan), when a fresh install has no main and an
     update may still have another version's."""
     mods = ctx.dest / 'mods'
-    if not mods.is_dir():
+    if not GAME['patches'] or not mods.is_dir():
         return []
     return sorted(f for mod in mods.iterdir() if mod.is_dir() for where in CHEAT_PLACES
                   for f in ((mod / where).glob('*.txt') if (mod / where).is_dir() else ()))
 
 
-EXEFS_PLACES = ('exefs', 'atmosphere/contents/0100F2C0115B6000/exefs', 'contents/0100F2C0115B6000/exefs',
-                '0100F2C0115B6000/exefs')
+EXEFS_PLACES = ('exefs', f'atmosphere/contents/{_T}/exefs', f'contents/{_T}/exefs', f'{_T}/exefs')
 
 
 def exefs_files(ctx):
     """The ExeFS patch files of the mods folder (.ips and .pchtxt in each mod's exefs places and its
     atmosphere/exefs_patches/<name>/, as tools/exefs_patches.py finds them), for the lift key."""
     mods = ctx.dest / 'mods'
-    if not mods.is_dir():
+    if not GAME['patches'] or not mods.is_dir():
         return []
     out = []
     for mod in (m for m in mods.iterdir() if m.is_dir()):
@@ -868,7 +870,8 @@ class Lift(Step):
         # fingerprint takes a file's name and content only; the paths under mods/ go in too, because tools/cheats.py
         # and tools/exefs_patches.py name each patch set after its mod folder, so a renamed folder needs a lift
         files = cheat_files(ctx) + exefs_files(ctx)
-        return fingerprint('lift-4', ctx.keys['extract'], ctx.layout.recomp, ctx.layout.patches(game_version(ctx)),
+        table = [t for t in (ctx.layout.patches(game_version(ctx)),) if t]   # the game's code patch table, if any
+        return fingerprint('lift-4', GAME['modules'], ctx.keys['extract'], ctx.layout.recomp, *table,
                            ctx.layout.tools / 'cheats.py', ctx.layout.tools / 'exefs_patches.py', *files,
                            *(f.relative_to(ctx.dest / 'mods').as_posix() for f in files))
 
@@ -893,7 +896,7 @@ class Lift(Step):
         # tools/exefs_patches.py); their status files tell the runtime what the build has. Both are the player's
         # downloads, so files the tools refuse cost those cheats or patches, not the install: the game is built
         # without them and the setup warns.
-        plain = layout.patches(game_version(ctx))
+        plain = layout.patches(game_version(ctx))   # None for a game without a patch table
         stages = [('cheats.py', 'patches-cheats.txt', cheats_status(ctx), cheat_files(ctx), 'warn.cheats_skipped'),
                   ('exefs_patches.py', 'patches-exefs.txt', exefs_status(ctx), exefs_files(ctx), 'warn.exefs_skipped')]
         patches, skipped = plain, {}
@@ -909,14 +912,15 @@ class Lift(Step):
                 skipped[warn] = log
             else:
                 patches = ctx.temp / out
-        args = ['--exefs', ctx.dest / 'exefs', '--out', gen]
-        code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + ['--patches', patches], parse)
+        args = ['--exefs', ctx.dest / 'exefs', '--out', gen, '--modules', GAME['modules']]
+        with_patches = (lambda t: ['--patches', t] if t else [])
+        code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + with_patches(patches), parse)
         if code and patches != plain:
             for tool, out, status, inputs, warn in stages:
                 if inputs and warn not in skipped:
                     status.unlink(missing_ok=True)
                     skipped[warn] = log
-            code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + ['--patches', plain], parse)
+            code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + with_patches(plain), parse)
         if code:
             raise InstallError('lift.failed', code=code, log=str(log))
         for warn, log in skipped.items():
@@ -947,10 +951,12 @@ class Compile(Step):
         return fingerprint('compile-3', ctx.keys['lift'], runtime_key(ctx))
 
     def current(self, ctx, record):
-        exe = ctx.dest / ('totk' + EXE)
+        exe = ctx.dest / GAME_EXE
         if not exe.is_file() or not (ctx.dest / 'romfs-index.bin').is_file():
             return False
         if not all((ctx.dest / d.name).is_file() for d in ctx.layout.dlls):
+            return False
+        if not GAME['prepare'] and not (ctx.dest / ctx.layout.xlate.name).is_file():
             return False
         return file_sha256(exe) == record.get('exe_sha256')
 
@@ -971,13 +977,13 @@ class Compile(Step):
         cpu = getattr(ctx, 'cpu', 'v3')
         lib = layout.runtime_lib_for(cpu)
         code, log = run_tool(ctx, 'compile', layout.tools / 'build_game.py', [
-            '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm, '--cpu', cpu,
+            '--game', GAME['game'], '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm, '--cpu', cpu,
             *(['--deps', layout.deps] if layout.deps else []), *(['--sysroot', layout.sysroot] if layout.sysroot else []),
             '--runtime', layout.runtime, *(['--runtime-lib', lib] if lib else ()), '--ninja', layout.ninja,
             '--version', version_tag(game_version(ctx)), '--expected', layout.expected(game_version(ctx)),
             '--exefs', dest / 'exefs', '--romfs', dest / 'romfs',
             '--profile', dest / 'profile'], parse)
-        exe = build / ('totk' + EXE)
+        exe = build / GAME_EXE
         if code or not exe.is_file():
             raise InstallError('compile.failed', code=code, log=str(log))
         try:
@@ -987,6 +993,13 @@ class Compile(Step):
         replace_file(build / 'romfs-index.bin', dest / 'romfs-index.bin')
         for dll in layout.dlls:
             replace_file(dll, dest / dll.name)
+        if not GAME['prepare']:   # Prepare copies the shader translator; without that step the game still needs it
+            for src in (layout.xlate, layout.xlate.with_suffix('.id')):
+                if src.is_file():
+                    try:
+                        replace_file(src, dest / src.name)
+                    except PermissionError:
+                        raise InstallError('prepare.xlate_in_use', path=str(dest / src.name)) from None
         return {'exe_sha256': file_sha256(dest / exe.name), 'cpu': cpu}
 
 
@@ -1259,4 +1272,6 @@ def romfs_problem(romfs, expected):
 
 
 def all_steps():
-    return [Check(), Fonts(), Extract(), Lift(), Compile(), Prepare(), Dlss(), Cleanup()]
+    """The steps of this game: fonts, prepare and dlss only where its profile uses them (tools/game_profile.py)."""
+    return [Check(), *([Fonts()] if GAME['fonts'] else []), Extract(), Lift(), Compile(),
+            *([Prepare()] if GAME['prepare'] else []), *([Dlss()] if GAME['dlss'] else []), Cleanup()]

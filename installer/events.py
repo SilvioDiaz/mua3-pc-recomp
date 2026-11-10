@@ -21,6 +21,8 @@ import threading
 import time
 from pathlib import Path
 
+from .layout import GAME
+
 CATALOG = Path(__file__).resolve().parent / 'text' / 'en.json'
 PROGRESS_EVERY = 0.5   # seconds between two progress events of one phase
 
@@ -29,14 +31,17 @@ def load_catalog(path=CATALOG):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-GAME_EXE = 'totk.exe' if os.name == 'nt' else 'totk'   # {game_exe} in the catalogs
+GAME_EXE = GAME['file'] + ('.exe' if os.name == 'nt' else '')   # {game_exe} in the catalogs
+# the game's names in the catalogs: {game_exe}, {game_name}, {game_ini}, {setup}, {versions} (tools/game_profile.py)
+GAME_PARAMS = {'game_exe': GAME_EXE, 'game_name': GAME['name'], 'game_ini': GAME['file'] + '.ini', 'setup': GAME['setup'],
+               'versions': ' / '.join(GAME['supported'])}
 
 
 def render(catalog, id, params=None):
     """The English text of id, or the id itself when the catalog lacks it."""
     text = catalog.get(id, id)
     try:
-        return text.format(**{'game_exe': GAME_EXE, **(params or {})})
+        return text.format(**{**GAME_PARAMS, **(params or {})})
     except (KeyError, IndexError, ValueError):
         return f'{text} {params}'
 

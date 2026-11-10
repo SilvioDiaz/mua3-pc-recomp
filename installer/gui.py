@@ -26,6 +26,7 @@ except ImportError:
 
 from . import ini
 from . import layout as layouts
+from .layout import GAME
 from .guilogic import (DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGE_LABELS, UI_LANGUAGES, Catalog, Form, Model,
                        Process, amount, default_game_language, describe_event, parse_line, windows_ui_language)
 
@@ -62,8 +63,8 @@ class App:
         self.fitted = None               # the (width, height) fit last gave the window
 
         root.title(self.cat('ui.title'))
-        icon = layout.runtime / 'totk.ico'
-        png = layout.runtime / 'totk.png'   # Tk loads no .ico off Windows; the Linux release converts it
+        icon = layout.runtime / (GAME['file'] + '.ico')
+        png = layout.runtime / (GAME['file'] + '.png')   # Tk loads no .ico off Windows; the Linux release converts it
         if os.name == 'nt' and icon.is_file():
             root.iconbitmap(default=str(icon))
         elif png.is_file():
@@ -212,10 +213,11 @@ class App:
             b.grid(row=i, column=2, padx=(8, 0))
             self.form_rows[name] = lab
         i = len(rows)
-        self.label(grid, 'ui.firmware').grid(row=i, column=0, sticky='w', pady=4)
-        ttk.Entry(grid, textvariable=self.vars['firmware']).grid(row=i, column=1, sticky='ew', pady=4)
-        self.button(grid, 'ui.browse', self.pick_firmware).grid(row=i, column=2, padx=(8, 0))
-        i += 1
+        if GAME['fonts']:   # the firmware is read only for the Switch shared fonts
+            self.label(grid, 'ui.firmware').grid(row=i, column=0, sticky='w', pady=4)
+            ttk.Entry(grid, textvariable=self.vars['firmware']).grid(row=i, column=1, sticky='ew', pady=4)
+            self.button(grid, 'ui.browse', self.pick_firmware).grid(row=i, column=2, padx=(8, 0))
+            i += 1
         self.label(grid, 'ui.game_language').grid(row=i, column=0, sticky='w', pady=4)
         self.lang_box = ttk.Combobox(grid, textvariable=self.vars['lang'], state='readonly', width=30)
         self.lang_box.grid(row=i, column=1, sticky='w', pady=4)
@@ -226,13 +228,15 @@ class App:
         ttk.Entry(grid, textvariable=self.vars['dest']).grid(row=i + 1, column=1, sticky='ew', pady=4)
         self.button(grid, 'ui.browse', self.pick_dest).grid(row=i + 1, column=2, padx=(8, 0))
         self.label(f, 'ui.compressed_help', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
-        self.label(f, 'ui.firmware_help', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
+        if GAME['fonts']:
+            self.label(f, 'ui.firmware_help', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
         # On by default and named with its source and licence: the player sees what is downloaded and can untick it
-        self.dlss_var = tk.BooleanVar(value=True)
-        dlss = ttk.Checkbutton(f, variable=self.dlss_var)
-        self.bind_text(dlss, 'text', 'ui.dlss')
-        dlss.pack(anchor='w', pady=(8, 0))
-        self.label(f, 'ui.dlss_help', wraplength=620, justify='left').pack(anchor='w', padx=(22, 0))
+        self.dlss_var = tk.BooleanVar(value=GAME['dlss'])
+        if GAME['dlss']:
+            dlss = ttk.Checkbutton(f, variable=self.dlss_var)
+            self.bind_text(dlss, 'text', 'ui.dlss')
+            dlss.pack(anchor='w', pady=(8, 0))
+            self.label(f, 'ui.dlss_help', wraplength=620, justify='left').pack(anchor='w', padx=(22, 0))
         self.update_hint = ttk.Label(f, wraplength=620, justify='left')
         self.update_hint.pack(anchor='w', pady=(8, 0))
         self.form_error = ttk.Label(f, style='Err.TLabel', wraplength=620, justify='left')
@@ -525,7 +529,7 @@ class App:
     def start_game(self):
         """Starts the game of the install folder and closes the window."""
         dest = Path(self.vars['dest'].get().strip())
-        exe = dest / ('totk.exe' if os.name == 'nt' else 'totk')
+        exe = dest / (GAME['file'] + ('.exe' if os.name == 'nt' else ''))
         flags = subprocess.DETACHED_PROCESS if os.name == 'nt' else 0
         if exe.is_file():
             subprocess.Popen([str(exe)], cwd=str(dest), creationflags=flags, close_fds=True)

@@ -34,10 +34,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
+from game_profile import GAME, ROOT as PROFILE_ROOT  # noqa: E402
+
 WIN = os.name == 'nt'
 EXE = '.exe' if WIN else ''
 UCRT = Path(r'C:\msys64\ucrt64\bin')
-SUPPORTED = ('1.2.1', '1.4.3', '1.1.0')   # updates the installer builds; the check identifies the player's by hash
+SUPPORTED = GAME['supported']   # updates the installer builds; the check identifies the player's by hash
 
 
 def version_tag(version):
@@ -80,27 +83,29 @@ class Layout:
         return None if self.dev else lib
 
     def patches(self, version):
-        """The code patch table for recomp/gen.py."""
-        return self.recomp / f'patches-{version_tag(version)}.txt'
+        """The code patch table for recomp/gen.py, None for a game without one (tools/game_profile.py 'table')."""
+        return self.recomp / GAME['table'].format(tag=version_tag(version)) if GAME['table'] else None
 
     def expected(self, version):
         """The expected hashes of the update."""
-        return self.tools / 'data' / f'expected-v{version}.json'
+        return self.tools / GAME['data'].relative_to(PROFILE_ROOT / 'tools') / f'expected-v{version}.json'
 
     def missing(self, cpu='v3'):
         """Paths the steps need that do not exist. cpu picks the runtime library the host will use."""
         lib = self.runtime_lib_for(cpu)
         need = [self.python, self.tools / 'extract.py', self.tools / 'ncz.py', self.tools / 'build_game.py',
-                self.tools / 'prepare_shaders.py',
-                self.tools / 'pack_shader_cache.py', self.tools / 'make_romfs_patches.py', self.tools / 'ultrawide_layout.py',
-                self.tools / 'button_icons.py',
-                self.tools / 'vendor' / 'macnativegames' / 'extract_shared_fonts.py',
+                self.tools / 'game_profile.py', self.tools / 'vendor_titles.py',
+                *((self.tools / 'prepare_shaders.py', self.tools / 'pack_shader_cache.py',
+                   self.tools / 'make_romfs_patches.py', self.tools / 'ultrawide_layout.py',
+                   self.tools / 'button_icons.py') if GAME['prepare'] else ()),
+                *((self.tools / 'vendor' / 'macnativegames' / 'extract_shared_fonts.py',) if GAME['fonts'] else ()),
                 self.recomp / 'gen.py',
                 self.clang,
                 *((self.deps / 'include', self.deps / 'lib') if self.deps else ()), self.runtime, *([lib] if lib else ()),
                 self.ninja, self.hactool,
-                self.xlate, *self.dlls, *(f(v) for v in SUPPORTED for f in (self.patches, self.expected))]
-        if self.shader_list:
+                self.xlate, *self.dlls, *(self.expected(v) for v in SUPPORTED),
+                *(self.patches(v) for v in SUPPORTED if GAME['table'])]
+        if self.shader_list and GAME['prepare']:
             need.append(self.shader_list)
         if self.sysroot:
             need.append(self.sysroot)

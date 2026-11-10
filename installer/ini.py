@@ -9,6 +9,8 @@ import os
 import re
 from pathlib import Path
 
+from .layout import GAME
+
 # runtime/ov_system.c: the codes TOTK_LANG offers. Each language appears once, under the code the game accepts.
 LANGUAGES = ('ja', 'en-US', 'en-GB', 'fr', 'fr-CA', 'de', 'it', 'es', 'es-419', 'nl', 'pt', 'pt-BR', 'ru', 'ko',
              'zh-Hans', 'zh-Hant')
@@ -62,7 +64,7 @@ def get_language(text):
 
 def write(dest, lang, example=None):
     """Write dest/totk.ini with lang; an existing file keeps its other lines. Returns the path."""
-    path = Path(dest) / 'totk.ini'
+    path = Path(dest) / (GAME['file'] + '.ini')
     if path.is_file():
         text = path.read_text(encoding='utf-8-sig')
     elif example and Path(example).is_file():
@@ -72,7 +74,7 @@ def write(dest, lang, example=None):
     new = set_language(text, lang)
     if path.is_file() and new == text:
         return path
-    tmp = path.with_name('totk.ini.tmp')
+    tmp = path.with_name(path.name + '.tmp')
     tmp.write_text(new, encoding='utf-8', newline='\n')
     os.replace(tmp, path)
     return path

@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path
 
-NAME = 'totk-install.json'
+from .layout import GAME
+
+NAME = GAME['file'] + '-install.json'
 FORMAT = 1
 
 

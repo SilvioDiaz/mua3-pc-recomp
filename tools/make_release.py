@@ -50,6 +50,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_xlate  # noqa: E402
 import check_content  # noqa: E402
 import shader_list  # noqa: E402
+from game_profile import GAME  # noqa: E402
+
+SETUP = GAME['setup'] + '.exe'   # TotK-Setup.exe, Cadence-Setup.exe
+# the game's names in the catalogs (installer/events.py GAME_PARAMS), filled into the launcher's two messages
+GAME_PARAMS = {'game_exe': GAME['file'] + '.exe', 'game_name': GAME['name'], 'game_ini': GAME['file'] + '.ini',
+               'setup': GAME['setup'], 'versions': ' / '.join(GAME['supported'])}
+GEN = None   # --gen: the generated C the runtime library builds against (default: lifted_version)
 
 ROOT = Path(__file__).resolve().parent.parent
 MAIN_ROOT = (ROOT / 'build').resolve().parent   # build/, generated/, toolchain/ and refs/ are junctions in a worktree
@@ -108,9 +115,9 @@ LLVM_SKIP_SUFFIXES = {'.idl', '.tlb'}
 TOOLS_FILES = ['build_game.py', 'build_shaders.py', 'button_icons.py', 'check_content.py', 'check_isa.py', 'extract.py',
                'hostmem.py', 'make_romfs_patches.py', 'ncz.py', 'pack_shader_cache.py', 'prepare_shaders.py',
                'romfs_index.py', 'shader_census.py', 'shader_list.py', 'ultrawide_layout.py', 'cheats.py',
-               'exefs_patches.py']
+               'exefs_patches.py', 'game_profile.py', 'vendor_titles.py']
 TOOLS_DIRS = ['vendor/macnativegames', 'data']   # data/: expected hashes
-RUNTIME_SUFFIXES = {'.h', '.inc', '.ico'}   # .ico: the installer window icon
+RUNTIME_SUFFIXES = {'.h', '.inc', *(('.ico',) if GAME['game'] == 'totk' else ())}   # .ico: the TotK window icon
 
 PROBES = ['--probe-kernel', '--probe-vkexec', '--probe-nvn-tex', '--probe-shader']
 
@@ -241,7 +248,9 @@ def tcltk_files():
     (src / name).rename(msi)
     shutil.rmtree(dest, ignore_errors=True)
     # Administrative image: copies the MSI's files to TARGETDIR, installs nothing and shows no window.
-    run(['msiexec', '/a', msi, '/qn', f'TARGETDIR={dest}'])
+    # one command string: msiexec takes TARGETDIR="a b" quoted after the =, not "TARGETDIR=a b" (paths with spaces)
+    print(f'+ msiexec /a {msi} /qn TARGETDIR={dest}', flush=True)
+    subprocess.run(f'msiexec /a "{msi}" /qn TARGETDIR="{dest}"', check=True)
     if not (dest / 'DLLs' / '_tkinter.pyd').is_file():
         sys.exit(f'{dest}: no _tkinter.pyd after msiexec /a')
     return dest
@@ -356,7 +365,7 @@ def collect_licenses(out):
         (unpack('zstd') / 'ucrt64' / 'share' / 'licenses' / 'zstd' / 'LICENSE', 'zstd-LICENSE.txt'),
         (ROOT / 'runtime' / 'shaders' / 'ffx' / 'LICENSE.txt', 'FidelityFX-FSR-LICENSE.txt'),
         (MAIN_ROOT / 'toolchain' / 'hactool' / 'LICENSE', 'hactool-LICENSE.txt'),
-        (MAIN_ROOT / 'refs' / 'MacNativeGames' / 'LICENSE', 'MacNativeGames-LICENSE.txt'),
+        (ROOT / 'tools' / 'vendor' / 'macnativegames' / 'LICENSE', 'MacNativeGames-LICENSE.txt'),
     ]
     for src, name in pairs:
         shutil.copy2(src, lic / name)
@@ -381,14 +390,16 @@ def lifted_version():
 def runtime_lib(out, llvm):
     """Build libtotkrt.a (x86-64-v3) and libtotkrt-v2.a (x86-64-v2) with the folder's llvm/, and copy them, the headers
     and the install-side sources into runtime/."""
-    version = lifted_version()
-    gen = MAIN_ROOT / 'generated' / version
+    version, gen = (('v' + GAME['supported'][0].replace('.', ''), GEN) if GEN
+                    else (lifted_version(), MAIN_ROOT / 'generated' / lifted_version()))
     rt = out / 'runtime'
     for cpu, name in (('v3', 'libtotkrt.a'), ('v2', 'libtotkrt-v2.a')):
         build = MAIN_ROOT / 'build' / 'release-check' / f'rtlib-{cpu}'
-        run([sys.executable, ROOT / 'tools' / 'build_game.py', '--make-runtime-lib', '--toolchain', llvm, '--cpu', cpu,
+        run([sys.executable, ROOT / 'tools' / 'build_game.py', '--make-runtime-lib', '--game', GAME['game'],
+             '--toolchain', llvm, '--cpu', cpu,
              '--version', version, '--deps', out / 'runtime' / 'deps', '--ninja', out / 'bin' / 'ninja.exe',
-             '--gen', gen, '--out', build],
+             '--gen', gen, '--out', build,
+             *(['--expected', GAME['data'] / f"expected-v{GAME['supported'][0]}.json"] if GEN else [])],
             env=clean_env(llvm / 'bin', out / 'bin'))
         shutil.copy2(build / 'libtotkrt.a', rt / name)
     for p in sorted((ROOT / 'runtime').rglob('*')):
@@ -406,9 +417,14 @@ def build_sources(out):
         shutil.copy2(ROOT / 'tools' / f, out / 'tools' / f)
     for d in TOOLS_DIRS:
         copy_tree(ROOT / 'tools' / d, out / 'tools' / d, lambda r: '__pycache__' in r or r.endswith('.md'))
-    (out / 'data').mkdir(exist_ok=True)
-    text = shader_list.history(MAIN_ROOT / 'refs' / 'MacNativeGames', MNG_COMMIT)
-    (out / 'data' / 'shader_list.tsv').write_text(text, encoding='utf-8', newline='\n')
+    if GAME['prepare']:   # the shader preparation step's list (TotK)
+        (out / 'data').mkdir(exist_ok=True)
+        text = shader_list.history(MAIN_ROOT / 'refs' / 'MacNativeGames', MNG_COMMIT)
+        (out / 'data' / 'shader_list.tsv').write_text(text, encoding='utf-8', newline='\n')
+    for name in ('README.md', 'LICENSE'):
+        shutil.copy2(ROOT / name, out / name)
+    if (ROOT / 'recomplauncher.json').is_file():   # RecompLauncher reads it at the top of the release
+        shutil.copy2(ROOT / 'recomplauncher.json', out / 'recomplauncher.json')
     copy_tree(ROOT / 'installer', out / 'installer', lambda r: '__pycache__' in r or r.startswith('launcher/'))
     shutil.copy2(ROOT / 'totk.ini.example', out / 'totk.ini.example')
     shutil.copy2(ROOT / 'THIRD_PARTY_NOTICES.md', out / 'THIRD_PARTY_NOTICES.md')
@@ -450,7 +466,7 @@ def launcher_header(path):
         texts = json.loads((ROOT / 'installer' / 'text' / f'{lang}.json').read_text(encoding='utf-8'))
         for key in ('title', 'python_missing'):
             macro = f'LAUNCHER_{key.upper()}_{lang.upper().replace("-", "_")}'
-            lines.append(f'#define {macro} {c_wide(texts["launcher." + key])}')
+            lines.append(f'#define {macro} {c_wide(texts["launcher." + key].format(**GAME_PARAMS))}')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('\n'.join(lines) + '\n', encoding='ascii')
 
@@ -459,11 +475,13 @@ def build_launcher(out, llvm):
     work = MAIN_ROOT / 'build' / 'release-check' / 'launcher'
     launcher_header(work / 'launcher_text.h')
     env = clean_env(llvm / 'bin')
-    res = work / 'launcher_rc.o'
-    run([llvm / 'bin' / 'llvm-windres.exe', '-I', ROOT / 'runtime', '-O', 'coff',
-         ROOT / 'installer' / 'launcher' / 'launcher.rc', '-o', res], env=env)
+    res = []
+    if GAME['game'] == 'totk':   # other games' setups have no icon
+        res = [work / 'launcher_rc.o']
+        run([llvm / 'bin' / 'llvm-windres.exe', '-I', ROOT / 'runtime', '-O', 'coff',
+             ROOT / 'installer' / 'launcher' / 'launcher.rc', '-o', res[0]], env=env)
     run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-Wall', '-Wl,-s', '-I', work,
-         ROOT / 'installer' / 'launcher' / 'launcher.c', res, '-o', out / 'TotK-Setup.exe'], env=env)
+         ROOT / 'installer' / 'launcher' / 'launcher.c', *res, '-o', out / SETUP], env=env)
 
 
 # ---- checks ----------------------------------------------------------------------------------------------------------
@@ -553,10 +571,13 @@ def main():
     ap.add_argument('--out', type=Path, required=True, help='release folder (replaced)')
     ap.add_argument('--zip', type=Path, help='also write the folder as this zip')
     ap.add_argument('--prove', action='store_true', help='only run the compile-and-probe check on an existing folder')
+    ap.add_argument('--gen', type=Path, help='generated C of the game (its layout.json) for the runtime library build')
     ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
                     help='--prove: build and run the check for this CPU level (default v3)')
     args = ap.parse_args()
     out = args.out.resolve()
+    global GEN
+    GEN = args.gen.resolve() if args.gen else None
     if args.prove:
         prove(out, args.cpu)
         return
