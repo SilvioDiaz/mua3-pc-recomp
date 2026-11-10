@@ -1158,7 +1158,9 @@ static void tab_mods(float scale) {
         if (ok) plat_file_mkdir_p(mods_dir());
         if (!ok || !plat_open_folder(mods_dir())) open_failed = plat_now_ns() + 3000000000ull;
     }
-    mods_builtin_rows();
+    // The built-in rows are TotK's patch sets (fps60, realtime, cloth, the resolution patch, the quick menu); another
+    // game has no patch table for them (frame_rate.c frame_rate_init), so they would do nothing there.
+    if (rt_game_id == 0) mods_builtin_rows();
     opt_end();
     if (rebuild) {
         restart_rebuild = true;

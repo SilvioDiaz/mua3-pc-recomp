@@ -9,6 +9,7 @@
 #include "flight.h"
 #include "gfx.h"
 #include "host.h"
+#include "nvn_api.h"
 #include "perfmon.h"
 #include "prof.h"
 #include "platform/platform.h"
@@ -100,6 +101,12 @@ static volatile int64_t counts[PERF_CNT_N];   // running totals: the perf log an
 
 void perf_count(int kind) {
     if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) plat_inc64(&counts[kind]);
+}
+
+int perf_sample_frame(void) {
+    if (!(rt_trace & RT_TRACE_PERF)) return 0;
+    uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    return f >= 1800 && f % 1800 < 2;
 }
 
 // ---- Frame-time summary, always on: every 60 s of play and at exit one line of frame count, mean fps, 1% low and the

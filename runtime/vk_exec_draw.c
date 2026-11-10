@@ -880,6 +880,10 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
         VK_MEM_USE(sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         if (written) vk_mem_gpu_wrote(&sp, n), vk_usnap_drop(addr, n);
+        if (written && n >= (256u << 10) && perf_sample_frame())   // shader-written bindings: what goes back each frame
+            rt_log("perf: frame %llu: written binding %#llx: %.2f MiB (size asked %#llx, use %d)",
+                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), (unsigned long long)addr,
+                   n / 1048576.0, (unsigned long long)size, use);
         count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
         return 1;
@@ -3370,7 +3374,37 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
-    if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
+    int quads = d->prim == NVN_DRAW_PRIMITIVE_QUADS;
+    if (quads) {
+        // No quad topology here: every four indices become two triangles, as op_draw does for DrawArrays. Drawn as the
+        // triangle list the pipeline has, the indices would group in threes across the quads (MUA3's effect sprites
+        // turned into stray triangles and streaks). Host-readable backing only, like byte indices.
+        if (sp.alloc) return warn_once(W_INDEX, "quad indices in device-local memory: draw skipped");
+        uint32_t q = (uint32_t)d->count / 4;
+        if (!q) return;
+        vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
+        vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, sizeof(uint32_t) * 6 * (uint64_t)q);
+        uint32_t *ix = malloc(sizeof *ix * 6 * (size_t)q);
+        if (!ix) rt_fatal("vk: out of memory");
+        const uint8_t *src = (const uint8_t *)(uintptr_t)d->ibuf;
+        static const uint8_t k[6] = {0, 1, 2, 0, 2, 3};
+        for (uint32_t i = 0; i < 4 * q; i += 4)
+            for (int j = 0; j < 6; j++) {
+                uint32_t v;
+                if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) v = src[i + k[j]];
+                else if (d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT) {
+                    uint16_t s;
+                    memcpy(&s, src + 2 * (size_t)(i + k[j]), sizeof s);
+                    v = s;
+                } else memcpy(&v, src + 4 * (size_t)(i + k[j]), sizeof v);
+                ix[i / 4 * 6 + j] = v;
+            }
+        bind_index(ex, ix, sizeof *ix * 6 * (size_t)q, VK_INDEX_TYPE_UINT32);
+        free(ix);
+        vkCmdDrawIndexed(ex->cb, 6 * q, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
+                         (uint32_t)d->base_instance);
+        ex->recorded++;
+    } else if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
@@ -3391,10 +3425,12 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
         VK_MEM_BOUND(sp);
     }
-    vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
-                     (uint32_t)d->base_instance);
-    ex->recorded++;
-    if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
+    if (!quads) {
+        vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
+                         (uint32_t)d->base_instance);
+        ex->recorded++;
+    }
+    if (!quads && d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
     if (vk_dump_armed) {
         char what[160];
         snprintf(what, sizeof what, "DrawElements prim %d count %d index size %u instances %d base vertex %d base instance "

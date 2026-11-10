@@ -792,6 +792,11 @@ static void upload(Tex *e) {
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
         ru_n++, ru_bytes += t->L.size, ru_ns += dt;
+        if (perf_sample_frame())   // which textures the CPU rewrites every frame
+            rt_log("perf: frame %llu: re-upload of texture %#llx fmt %#x %ux%u flags %#x gpu-written %d, %.1f KiB, %.3f ms",
+                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+                   (unsigned long long)e->pub.addr, d->format, d->width, d->height, d->flags, e->wr_fence != 0,
+                   t->L.size / 1024.0, dt / 1e6);
         if (e->wt_n) {
             ru_wt_n++, ru_wt_bytes += t->L.size, ru_wt_ns += dt;
             if (rt_trace & RT_TRACE_PERF)

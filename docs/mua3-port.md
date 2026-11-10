@@ -442,12 +442,39 @@ visibilidade padrão pela lista global em ordem de carga (main primeiro), e só 
 - Também: `audren.c` `update_voice` passou a usar a posição do registro como slot (como o Ryujinx), não o campo id.
 - Os 7 efeitos aux (mixes 3-9) são o reverb da Koei feito na CPU; o anel funciona.
 
-## Próximos marcos
+## Rodada 16 (2026-11-10): triângulos e riscos nos efeitos
 
-1. (feito na rodada 4) Reproduzir o vídeo sob demanda e descobrir por que o quadro decodificado não aparece (o jogo usa
-   `Buffer::SetNvnDev/SetNvnSync` nos buffers de saída).
-2. Corrigir a perda da GPU depois do vídeo.
-3. Entrar no gameplay (menu de save -> primeira fase).
-2. Logs de um emulador derivado do Ryujinx (serviços e stubs usados pelo MUA3) como roteiro do runtime.
-3. Tirar do caminho do MUA3 o que é específico do TotK no runtime (patches por endereço, tabelas de versão).
-4. Implementar as funções `nn::*`, serviços e SVCs que faltarem até o primeiro boot.
+- Sintoma: estilhaços pretos/ciano em volta dos efeitos de golpe (F7, quadro 6986, `build\upd\dump`, passe 17).
+- O passe 17 tem 38 draws de efeito, 15 deles com `prim 7` (QUADS). `op_draw` (DrawArrays) já convertia quads em
+  triângulos; `op_draw_idx` (DrawElements) não, e os índices iam como lista de triângulos, agrupados de 3 em 3
+  atravessando os quads.
+- Correção: `vk_exec_draw.c` `op_draw_idx` reescreve os índices (0 1 2, 0 2 3 por quad) num buffer temporário.
+  Draws indiretos com quads continuam sem conversão. **Confirmado na play26** (luta na nave Kree, gravação de 66 s):
+  os efeitos de golpe saem sem estilhaços.
+
+## Desempenho com 60 fps (2026-11-10, play24)
+
+- Menus e cenas leves: 59-60 fps. Fases a ~48-56 fps; play22 (sem o cheat) ficava preso em 30.
+- Nessas cenas a GPU não fica ociosa esperando a CPU (0 ms "waiting for the next submission"); a fila da GPU fica
+  cheia: ~11,5 ms de trabalho medido + ~6,5-8,5 ms não medido por quadro. A thread de render passa ~16 ms esperando
+  o `nvnSyncWait` do jogo. O "bound: cpu" do log engana: o tempo não medido (cópias) não entra na conta.
+- Cópias por quadro: upload do espelho em VRAM ~28-37 MiB, write-back ~21 MiB (bindings que o shader escreve voltam
+  inteiros para a memória do jogo), flush do jogo 2 x 4 MiB, 2 texturas de 4 MiB reenviadas por quadro.
+- Diagnóstico novo (só com `trace = perf`): em 2 quadros a cada 1800 o log mostra `mirror upload/write-back` por
+  pool e offset, `mirror flush span`, `written binding` (>= 256 KiB) e `re-upload of texture`. Próximo passo: uma
+  partida numa fase, depois decidir entre (a) devolver só o que a CPU lê, (b) não reenviar texturas que só a GPU
+  escreve, (c) cópias numa fila de transferência separada.
+
+## Próximos marcos (revistos em 2026-11-10)
+
+Base: continuar no runtime HLE (este repositório). O HWDER (`..\hwder-mua3`, GPU em baixo nível) fica parado como
+referência: trava ~2 s depois do boot.
+
+1. Desempenho nas fases (48-56 -> 60 fps): na play26 há 32 MiB de upload + 22 MiB de write-back por quadro e
+   2 texturas de 4 MiB reenviadas por quadro (~0,85 ms); a thread de render passa ~15 ms no fence. Ordem: (b) não
+   reenviar texturas que só a GPU escreve, (a) devolver só o que a CPU lê, (c) fila de transferência separada.
+2. Iluminação ciano: comparar o ponto da play9 com uma referência do mesmo lugar.
+3. Causa real do geometry shader de culling contar só 5% (hoje contornado por `mua3_list_tris.geom`); quads em
+   draws indiretos.
+4. Teste de cobertura pelo usuário: capítulos, vídeos, save/load, troca de personagens, DLC, dois controles.
+5. Levar ao cadence-recomp as correções gerais: ligação de símbolos do `loader.c`, mix por splitter, quads indexados.

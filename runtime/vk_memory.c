@@ -1245,6 +1245,13 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
             mregions[k++] = (VkBufferCopy){lo, lo, hi - lo};
         }
         if (!k) continue;
+        if (perf_sample_frame())   // which pools and offsets carry the per-frame mirror traffic
+            for (int j = 0; j < k; j++)
+                if (mregions[j].size >= (256u << 10))
+                    rt_log("perf: frame %llu: mirror %s pool %#llx+%#llx: offset %#llx, %.2f MiB",
+                           (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
+                           to_mirror ? "upload" : "write-back", (unsigned long long)r->lo, (unsigned long long)r->size,
+                           (unsigned long long)mregions[j].srcOffset, mregions[j].size / 1048576.0);
         if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
         else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
         rec++;
@@ -1402,6 +1409,10 @@ static void mirror_sync(PoolRec *r) {
         plat_mutex_unlock(&flush_lock);
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
+        if (a < b && perf_sample_frame())
+            rt_log("perf: frame %llu: mirror flush span pool %#llx: offset %#llx, %.2f MiB",
+                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), (unsigned long long)r->lo,
+                   (unsigned long long)(a - lo), (b - a) / 1048576.0);
         if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
     }
     mrep.syncs++;
