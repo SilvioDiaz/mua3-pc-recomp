@@ -1342,13 +1342,25 @@ void vk_dump_init(void) {
     if (f) dump_start(f);
 }
 
-// F7 in the game window (gfx_window_win.c): the frame three presents from now is dumped, as TOTK_DUMP=<that frame>
-// would; once per run.
+static int key_dumps;   // F7 dumps begun: the second and later go to <TOTK_DUMP_DIR>_2, _3, ...
+
+// F7 in the game window (gfx_window_win.c): the frame two presents from now is dumped, as TOTK_DUMP=<that frame>
+// would. Again on every press once the dump before it is written; a press while one is armed is ignored.
 void vk_dump_key(void) {
-    static int used;
-    if (used || vk_dump_armed) return;
-    used = 1;
-    dump_start(frame_now() + 3);
+    if (vk_dump_armed) return;
+    if (key_dumps++) {   // state the last dump left behind
+        seq = finished = copied = snaps = 0;
+        png_bytes = bin_bytes = 0;
+        raw_bytes = 0;
+        nwant_tex = nwant_pass = nwant_sh = 0;
+        last_targets = 0;
+        pass_skip = NULL;
+        nents = ents_over = pass_draws = nluts = nluts_done = 0;
+        memset(drop_cnt, 0, sizeof drop_cnt);
+        free(bd_prev), bd_prev = NULL;
+        bd_addr = bd_size = 0;
+    }
+    dump_start(frame_now() + 2);
 }
 
 static void dump_start(uint64_t frame) {
@@ -1386,7 +1398,8 @@ static void dump_start(uint64_t frame) {
         q = e;
     }
     const char *d = cfg_get("TOTK_DUMP_DIR");
-    snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
+    if (key_dumps > 1) snprintf(dir, sizeof dir, "%s_%d", d && *d ? d : "dump", key_dumps);
+    else snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
     make_dirs(dir);
     char path[600];
     snprintf(path, sizeof path, "%s/passes.txt", dir);
@@ -1434,4 +1447,5 @@ void vk_dump_present(uint64_t frame) {
     rt_log("vk_dump: frame %llu: %d passes and dispatches, %d draws snapshotted, about %llu MB of PNGs, %llu MB raw, "
            "%llu MB of buffers in %s", (unsigned long long)frame, seq, snaps, (unsigned long long)(png_bytes >> 20),
            (unsigned long long)(raw_bytes >> 20), (unsigned long long)(bin_bytes >> 20), dir);
+    vk_dump_armed = 0;   // F7 may start another
 }
