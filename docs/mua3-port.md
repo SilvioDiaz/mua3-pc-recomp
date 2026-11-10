@@ -452,6 +452,26 @@ visibilidade padrão pela lista global em ordem de carga (main primeiro), e só 
   Draws indiretos com quads continuam sem conversão. **Confirmado na play26** (luta na nave Kree, gravação de 66 s):
   os efeitos de golpe saem sem estilhaços.
 
+## Rodada 17 (2026-11-10): ciano = texturas sRGB amostradas como UNORM
+
+- Dump usado: `build\upd\dump27` (F7, quadro 4059, luta na nave Kree). Passe a passe: albedo do G-buffer (passe 5 t0)
+  quase branco no cenário e personagens lavados (Groot amarelo); luz diferida (passe 11) e transparentes (16) com o
+  chão em G~0,19 linear; a exposição automática está travada em 1 pelo próprio jogo (passe 22, limites c3[2] = 1..1);
+  o tonemap (passe 29, curva Hable + LUT 256x1) quase não muda os valores; o passe 31 só codifica para sRGB. Ou seja,
+  pós-processamento certo, cena já clara demais na entrada.
+- Causa: o MUA3 cria os mapas de cor como BC UNORM (NVN 0x42 DXT1, 0x44 DXT5) e os registra por views sRGB (0x46,
+  0x48): no passe 5, 47 das texturas do slot 0 e todas as 0x48. `vk_exec_draw.c` `get_view` criava a view amostrada
+  sempre com o formato da imagem, então o sRGB da view era ignorado: albedo sem decodificação (cinza médio 0,21 lido
+  como 0,5) e cena ~2x mais clara, o que estoura o piso iluminado em ciano e deixa os personagens acinzentados.
+- Correção: `sampled_format` usa o formato da view quando ele é o gêmeo sRGB/UNORM do formato da imagem (as imagens de
+  cor já são MUTABLE_FORMAT). `TOTK_VIEW_SRGB=0` volta ao comportamento antigo.
+- play30 (três F7: `dump30`, `dump30_2`, `dump30_3`, nave Kree): albedo médio 0,65 -> 0,34-0,40 (gravado em sRGB), cena
+  iluminada com mediana do verde 0,19 -> 0,02-0,03. Nas imagens: chão azul-petróleo escuro sem estouro, Groot marrom,
+  Star-Lord vermelho, Gamora verde, explosões laranja. Sem FATAL nem perda de dispositivo. Os dumps estouraram o limite
+  de passes antes do tonemap (só vão até a cena com transparentes), então o quadro final não está neles.
+  **Confirmado pelo usuário:** na tela o brilho ficou como o do jogo original.
+- O rótulo do dump (`vk133 ... view-nvn-fmt 0x46`) mostra o formato da imagem, não o da view.
+
 ## Desempenho com 60 fps (2026-11-10, play24)
 
 - Menus e cenas leves: 59-60 fps. Fases a ~48-56 fps; play22 (sem o cheat) ficava preso em 30.
@@ -473,7 +493,7 @@ referência: trava ~2 s depois do boot.
 1. Desempenho nas fases (48-56 -> 60 fps): na play26 há 32 MiB de upload + 22 MiB de write-back por quadro e
    2 texturas de 4 MiB reenviadas por quadro (~0,85 ms); a thread de render passa ~15 ms no fence. Ordem: (b) não
    reenviar texturas que só a GPU escreve, (a) devolver só o que a CPU lê, (c) fila de transferência separada.
-2. Iluminação ciano: comparar o ponto da play9 com uma referência do mesmo lugar.
+2. ~~Iluminação ciano~~: resolvida na rodada 17 (views sRGB), confirmada na play30.
 3. Causa real do geometry shader de culling contar só 5% (hoje contornado por `mua3_list_tris.geom`); quads em
    draws indiretos.
 4. Teste de cobertura pelo usuário: capítulos, vídeos, save/load, troca de personagens, DLC, dois controles.

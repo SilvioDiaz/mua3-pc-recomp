@@ -492,6 +492,35 @@ typedef struct ViewNode { struct ViewNode *next; ViewKey k; VkImageView view; } 
 static nvn_hmap view_of;                 // ViewKey -> VkImageView
 static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
+// The sRGB format of a UNORM colour format and the reverse (same texels, other transfer function); VK_FORMAT_UNDEFINED
+// for a format without such a twin.
+static VkFormat srgb_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    default: break;
+    }
+    // BC1..BC3, BC7 and ASTC list each UNORM format right before its sRGB one, the UNORM value being odd
+    if ((f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) || f == VK_FORMAT_BC7_UNORM_BLOCK ||
+        f == VK_FORMAT_BC7_SRGB_BLOCK || (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK))
+        return (f & 1) ? f + 1 : f - 1;
+    return VK_FORMAT_UNDEFINED;
+}
+
+// The format a sampled view of img reads with: the image's, or its sRGB/UNORM twin when the NVN view asks for that one.
+// MUA3 creates its colour maps as UNORM BC textures (0x42, 0x44) and registers them through sRGB views (0x46, 0x48);
+// sampled as UNORM the albedo came out washed out and the lit scene about twice too bright. Colour images are created
+// MUTABLE_FORMAT (vk_texture.c create_tex). TOTK_VIEW_SRGB=0: the image's format always.
+static VkFormat sampled_format(const VkTexImage *img, const view_t *v, int hv) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("VIEW_SRGB", "1");
+    TexVkFormat b;
+    if (!on || !hv || !v->set_format || !tex_vk_format(v->format, &b) || b.vk == img->format) return img->format;
+    return b.vk == srgb_twin(img->format) ? b.vk : img->format;
+}
+
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
@@ -542,12 +571,13 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    VkFormat vfmt = storage ? img->format : sampled_format(img, v, hv);
+    ViewKey k = {img->image, vfmt, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = vfmt,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
