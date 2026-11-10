@@ -2402,11 +2402,15 @@ static int is_mua3_cull_gs(const GfxShader *s) {
     return r[0].handle != r[1].handle;
 }
 
-// The geometry shader a draw runs: gs itself, or the list-everything stand-in for MUA3's culling shader. The last
-// answer is kept, since a frame binds the same shader for hundreds of prepass draws. Replay thread only.
-static const GfxShader *gs_list_all(const GfxShader *gs) {
+// The geometry shader a draw runs: gs itself, or the list-everything stand-in for MUA3's culling shader. The stand-in
+// passes on only the vertex shader's output 0, which is all the prepass fragment shader reads, so it is used only when
+// the fragment shader reads nothing else (or there is none). The effects draws bind the same culling shader with
+// fragment shaders that read texture coordinates and colours: there the game's shader keeps running, and its
+// passthrough culling hides the effect triangles it should (listed by the stand-in, they became huge flat planes and
+// streaks). The last answer is kept, since a frame binds the same pair for hundreds of prepass draws. Replay thread only.
+static const GfxShader *gs_list_all(const GfxShader *gs, const GfxShader *fs) {
     static int on = -1;
-    static const GfxShader *own, *last_in, *last_out;
+    static const GfxShader *own, *last_in, *last_fs, *last_out;
     if (on < 0) {
         on = RT_MUA3 && rt_knob("GS_LIST_ALL", "1");
         if (on) {
@@ -2415,8 +2419,9 @@ static const GfxShader *gs_list_all(const GfxShader *gs) {
         }
     }
     if (!on || !gs) return gs;
-    if (gs == last_in) return last_out;
-    last_in = gs, last_out = is_mua3_cull_gs(gs) ? own : gs;
+    if (gs == last_in && fs == last_fs) return last_out;
+    last_in = gs, last_fs = fs;
+    last_out = is_mua3_cull_gs(gs) && (!fs || !(gfx_shader_inputs(fs, NULL) & ~1u)) ? own : gs;
     if (last_out == own) {
         static int said;
         if (!said++) rt_log("vk_exec: MUA3's culling geometry shader is replaced by one that lists every triangle (TOTK_GS_LIST_ALL=0 keeps it)");
@@ -2485,7 +2490,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
     }
     if (has_gs && !gs) return DROP(VK_DROP_SHADER_FAILED);
-    gs = gs_list_all(gs);
+    gs = gs_list_all(gs, has_fs ? fs : NULL);
     if (vk_dlaa_skip_draw(ex, fs)) return DROP(VK_DROP_DLAA);   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
