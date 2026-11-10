@@ -66,6 +66,7 @@ typedef struct Mixer {
     unsigned reported;                             // one-time reports
     float voice_scratch[6][MAX_FRAME], filter_scratch[MAX_FRAME], output_scratch[MAX_FRAME * OUT_MAX];
     double level_sum, level_peak; uint64_t level_count, level_frames; int first_sound_logged;
+    double mix_sum[256], mix_peak[256]; uint64_t mix_n[256];   // TOTK_TRACE=audio: each mix's level after its effects
     int prefill;                                   // render blocks
 } Mixer;
 
@@ -300,6 +301,7 @@ static void sink_dump(const float *raw, int frames) {
     }
 }
 
+static void voice_report(AudioRenderer *r);
 // Level meter (TOTK_TRACE=audio): one line per 5 s of output, and the first nonzero frame.
 static void level_note(AudioRenderer *r, Mixer *m, const float *out, int frames) {
     if (!(rt_trace & RT_TRACE_AUDIO)) return;
@@ -327,6 +329,7 @@ static void level_note(AudioRenderer *r, Mixer *m, const float *out, int frames)
                queued * 1000.0 / r->param.sample_rate, (unsigned long long)atomic_load(&m->skipped_frames));
         m->level_sum = m->level_peak = 0;
         m->level_count = m->level_frames = 0;
+        voice_report(r);
     }
 }
 
@@ -606,6 +609,112 @@ static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAM
     v->adpcm.history[0] = w.h1; v->adpcm.history[1] = w.h2; v->adpcm.buffer = w.abuf; v->adpcm.at = w.aat;
 }
 
+/* Voice meter (TOTK_TRACE=audio): every 5 s of output one line per voice that played in that window, with its format,
+   routing and decoded level, to tell a voice that decodes silence from one whose mix never reaches the sink. */
+#define VOICE_NOTE_MAX 1024
+static struct { double sum, peak; uint64_t n; uint8_t seen; } voice_level[VOICE_NOTE_MAX];
+static void voice_note(AudioRenderer *r, Mixer *m, int i, const ServerVoice *v, float out[6][MAX_FRAME], int frames) {
+    (void)r; (void)m;
+    if (i >= VOICE_NOTE_MAX) return;
+    for (int c = 0; c < (int)v->in.channel_count && c < 6; c++) for (int k = 0; k < frames; k++) {
+        double x = out[c][k];
+        voice_level[i].sum += x * x;
+        if (fabs(x) > voice_level[i].peak) voice_level[i].peak = fabs(x);
+    }
+    voice_level[i].n += (uint64_t)frames * v->in.channel_count;
+    voice_level[i].seen = 1;
+}
+static int mix_valid(AudioRenderer *r, int32_t id);
+static void voice_report(AudioRenderer *r) {
+    int shown = 0, n = r->param.voice_count < VOICE_NOTE_MAX ? r->param.voice_count : VOICE_NOTE_MAX;
+    for (int i = 0; i < n; i++) {
+        if (!voice_level[i].seen) continue;
+        const ServerVoice *v = &r->voices[i];
+        const AudrenWaveBuffer *b = &v->buffers[v->index];
+        if (shown++ < 48)
+            rt_log("audio: voice %d fmt %u ch %u %u Hz pitch %.3f vol %.3f mix %d splitter %d extra %llu rms %.4f peak %.4f "
+                   "buf[%u] %llu bytes %d..%d loop %u ctx %llu valid %u%u%u%u", i, v->in.sample_format, v->in.channel_count,
+                   v->in.sample_rate, v->in.pitch, v->in.volume, v->in.mix_id, (int)v->in.splitter_id,
+                   (unsigned long long)v->in.extra_size, voice_level[i].n ? sqrt(voice_level[i].sum / (double)voice_level[i].n) : 0,
+                   voice_level[i].peak, v->index, (unsigned long long)b->size, b->start, b->end, b->loop,
+                   (unsigned long long)b->context_size, v->valid[0], v->valid[1], v->valid[2], v->valid[3]);
+        voice_level[i].sum = voice_level[i].peak = 0;
+        voice_level[i].n = 0;
+        voice_level[i].seen = 0;
+    }
+    rt_log("audio: %d voices played in the last window", shown);
+    // Voices the client uses but that did not play: why not (server state, client play state, buffer slots).
+    int listed = 0, in_use = 0;
+    for (int i = 0; i < r->param.voice_count; i++) {
+        const ServerVoice *v = &r->voices[i];
+        if (!v->in.in_use) continue;
+        in_use++;
+        if (listed++ < 16)
+            rt_log("audio: voice %d in use: server state %u play_state %u fmt %u ch %u %u Hz index %u valid %u%u%u%u "
+                   "pending %u%u%u%u wave buffers %u (client index %u) played %llu", i, v->state, v->in.play_state,
+                   v->in.sample_format, v->in.channel_count, v->in.sample_rate, v->index, v->valid[0], v->valid[1],
+                   v->valid[2], v->valid[3], v->pending[0], v->pending[1], v->pending[2], v->pending[3],
+                   v->in.wave_buffer_count, v->in.wave_buffer_index, (unsigned long long)v->played);
+    }
+    rt_log("audio: %d voices in use", in_use);
+    // Memory pools by state: the client attaches the memory holding its wave data before a voice can play from it.
+    int states[8] = {0};
+    uint64_t attached_bytes = 0;
+    for (int i = 0; i < r->param.effect_count + 4 * r->param.voice_count; i++) {
+        uint32_t st = r->pools[i].state;
+        states[st < 8 ? st : 7]++;
+        if (st == POOL_ATTACHED) attached_bytes += r->pools[i].size;
+    }
+    rt_log("audio: pools invalid %d new %d req-detach %d detached %d req-attach %d attached %d (%.1f MiB) released %d",
+           states[0], states[1], states[2], states[3], states[4], states[5], attached_bytes / 1048576.0, states[6]);
+    // Auxiliary effects: the ring headers on both sides and the level the client returns.
+    for (int i = 0; i < r->param.effect_count; i++) {
+        const AudrenEffectIn *e = &r->effects[i];
+        if (e->type != 2) continue;
+        AudrenAuxParam p; memcpy(&p, e->specific, sizeof p);
+        if (!p.send_info || !p.return_info) { rt_log("audio: aux effect %d mix %d enabled %u: no buffers", i, e->mix_id, e->enabled); continue; }
+        const uint32_t *s = ipc_guest(p.send_info, 128), *t = ipc_guest(p.return_info, 128 + (uint64_t)p.capacity * 4);
+        const int32_t *d = (const int32_t *)((const uint8_t *)t + 128);
+        double sum = 0, sum2 = 0;
+        for (uint32_t k = 0; k < p.capacity; k++) sum += (double)d[k] * d[k];
+        if (p.return_storage) {
+            const int32_t *st = ipc_guest(p.return_storage, (uint64_t)p.capacity * 4);
+            for (uint32_t k = 0; k < p.capacity; k++) sum2 += (double)st[k] * st[k];
+        }
+        rt_log("audio: aux effect %d send info %#llx storage %#llx return info %#llx storage %#llx, rms at return storage %.1f",
+               i, (unsigned long long)p.send_info, (unsigned long long)p.send_storage, (unsigned long long)p.return_info,
+               (unsigned long long)p.return_storage, p.capacity ? sqrt(sum2 / p.capacity) : 0);
+        rt_log("audio: aux effect %d mix %d enabled %u ch %u cap %u in %u,%u out %u,%u send cpu %u/%u/%u/%u dsp %u/%u/%u/%u "
+               "return cpu %u/%u/%u/%u dsp %u/%u/%u/%u return rms %.1f", i, e->mix_id, e->enabled, p.channels, p.capacity,
+               p.input[0], p.input[1], p.output[0], p.output[1], s[0], s[1], s[2], s[3], s[16], s[17], s[18], s[19],
+               t[0], t[1], t[2], t[3], t[16], t[17], t[18], t[19], p.capacity ? sqrt(sum / p.capacity) : 0);
+    }
+    // Mixes in use, their level after their effects and where they go, so a chain that never reaches the sink shows.
+    Mixer *m = r->mixer;
+    for (int i = 0; i <= r->param.submix_count; i++) {
+        const AudrenMixIn *x = &r->mixes[i];
+        double rms = 0, peak = 0;
+        if (i < 256) {
+            rms = m->mix_n[i] ? sqrt(m->mix_sum[i] / (double)m->mix_n[i]) : 0;
+            peak = m->mix_peak[i];
+            m->mix_sum[i] = m->mix_peak[i] = 0;
+            m->mix_n[i] = 0;
+        }
+        if (!x->in_use) continue;
+        rt_log("audio: mix %d buffers %d volume %.3f dest mix %d dest splitter %d rms %.4f peak %.4f", i, x->buffer_count,
+               x->volume, x->dest_mix_id, (int)x->dest_splitter_id, rms, peak);
+        if (x->dest_splitter_id == SPLITTER_UNUSED || x->dest_splitter_id >= (uint32_t)m->nsplit) continue;
+        const SplitInfo *s = &m->split[x->dest_splitter_id];
+        for (int k = 0; k < s->ndest && k < 8; k++) {
+            const SplitDest *d = &m->dest[s->ids[k]];
+            rt_log("audio:   splitter %d destination %d (id %d): mix %d used %u valid %d vol %.3f %.3f %.3f %.3f",
+                   (int)x->dest_splitter_id, k, s->ids[k], d->dest, d->used, mix_valid(r, d->dest), d->vol[0], d->vol[1],
+                   d->vol[2], d->vol[3]);
+        }
+        if (s->ndest == 0) rt_log("audio:   splitter %d has no destinations", (int)x->dest_splitter_id);
+    }
+}
+
 /* ---------- mixing ---------- */
 static float *mixbuf(Mixer *m, int i) { return m->buf + (size_t)i * (size_t)m->frame; }
 static void accumulate(Mixer *m, int buffer, const float *src, float vol, int frames) {
@@ -613,14 +722,30 @@ static void accumulate(Mixer *m, int buffer, const float *src, float vol, int fr
     float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
-static int mix_depth(AudioRenderer *r, int id) {
-    int d = 0;
-    for (int guard = 0; id > 0 && guard < 64; guard++, d++) {
-        if (!mix_valid(r, r->mixes[id].dest_mix_id)) return d + 1;
-        id = r->mixes[id].dest_mix_id;
+// Steps from mix `id` to the final mix along its longest route, following both a direct destination and every
+// destination of a destination splitter (Ryujinx MixContext sorts by the same distance). A submix must be folded
+// before every mix it feeds: counting only direct destinations ranked a splitter-routed mix (MUA3's music, mix 10
+// through splitter 1) below its destination, so its samples arrived after that mix had been folded and were lost.
+static int mix_depth_at(AudioRenderer *r, int id, int guard) {
+    if (id <= 0 || guard >= 64) return 0;
+    const AudrenMixIn *x = &r->mixes[id];
+    Mixer *m = r->mixer;
+    int best = 1;   // a submix with no valid destination still sits above the final mix
+    if (mix_valid(r, x->dest_mix_id)) {
+        int d = 1 + mix_depth_at(r, x->dest_mix_id, guard + 1);
+        if (d > best) best = d;
+    } else if (x->dest_splitter_id != SPLITTER_UNUSED && x->dest_splitter_id < (uint32_t)m->nsplit) {
+        const SplitInfo *s = &m->split[x->dest_splitter_id];
+        for (int k = 0; k < s->ndest; k++) {
+            const SplitDest *dst = &m->dest[s->ids[k]];
+            if (!dst->used || !mix_valid(r, dst->dest)) continue;
+            int d = 1 + mix_depth_at(r, dst->dest, guard + 1);
+            if (d > best) best = d;
+        }
     }
-    return d;
+    return best;
 }
+static int mix_depth(AudioRenderer *r, int id) { return mix_depth_at(r, id, 0); }
 
 /* Guest custom effects exchange int32 samples in two rings. Each ring has CPU and DSP
    0x40-byte headers followed by samples; only the DSP header's owned cursor is advanced. */
@@ -765,6 +890,17 @@ static void mix_effects(AudioRenderer *r, int mix) {
     }
 }
 
+static void mix_note(Mixer *m, int mix, int first, int buffers) {
+    if (mix < 0 || mix >= 256) return;
+    for (int c = 0; c < buffers && first + c < m->nbuf; c++) {
+        const float *b = mixbuf(m, first + c);
+        for (int k = 0; k < m->frame; k++) {
+            m->mix_sum[mix] += (double)b[k] * b[k];
+            if (fabsf(b[k]) > m->mix_peak[mix]) m->mix_peak[mix] = fabsf(b[k]);
+        }
+        m->mix_n[mix] += (uint64_t)m->frame;
+    }
+}
 static const float *splitter_filter(SplitDest *d,const float *input,float *output,int frames){
     if(!d->biquads[0].enable&&!d->biquads[1].enable)return input;
     memcpy(output,input,(size_t)frames*sizeof *output);
@@ -818,6 +954,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate || !v->valid[v->index]) continue;
         int cc = (int)v->in.channel_count; if (cc < 1 || cc > 6) { report_once(m, 2, "voice channel count unsupported", cc); continue; }
         voice_render(r, v, vs, frames);
+        if (rt_trace & RT_TRACE_AUDIO) voice_note(r, m, i, v, vs, frames);
         for (int f = 0; f < 2; f++) if (v->in.biquads[f].enable) {
             const AudrenBiquad *b = &v->in.biquads[f];
             const AudrenBiquadFloat *bf=&v->float_biquads[f];
@@ -859,6 +996,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     for (int a = 0; a < n; a++) {
         mix_effects(r, order[a]);
         const AudrenMixIn *x = &r->mixes[order[a]]; int src = m->offset[order[a]];
+        if (rt_trace & RT_TRACE_AUDIO) mix_note(m, order[a], src, x->buffer_count);
         if (x->dest_splitter_id != SPLITTER_UNUSED && x->dest_splitter_id < (uint32_t)m->nsplit) {
             const SplitInfo *s = &m->split[x->dest_splitter_id];
             for (int c = 0; c < x->buffer_count && c < 24; c++) for (int k = c; k < s->ndest; k += x->buffer_count) {
@@ -872,7 +1010,10 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 for (int b = 0; b < r->mixes[x->dest_mix_id].buffer_count && b < 24; b++) accumulate(m, m->offset[x->dest_mix_id] + b, mixbuf(m, src + c), x->mix[c][b] * x->volume, frames);
         }
     }
-    if (r->mixes[0].in_use) mix_effects(r, 0);
+    if (r->mixes[0].in_use) {
+        mix_effects(r, 0);
+        if (rt_trace & RT_TRACE_AUDIO) mix_note(m, 0, m->offset[0], r->mixes[0].buffer_count);
+    }
     /* device sink */
     const AudrenSinkIn *sink = NULL;int circular=0;
     for (int i = 0; i < r->param.sink_count; i++) if (r->sinks[i].in_use) {
@@ -884,8 +1025,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     float *out=m->output_scratch;
     memset(out, 0, sizeof(float) * (size_t)oc * (size_t)frames);
     if (sink && sink->input_count >= 1 && sink->input_count <= 6) {
-        if (!(m->reported & (1u << 6))) {
-            m->reported |= 1u << 6;
+        if (!(m->reported & (1u << 7))) {   // bit 6 is the auxiliary effect report
+            m->reported |= 1u << 7;
             rt_log("audio: device sink has %u inputs, output %s", sink->input_count, oc == 6 ? "5.1" : "stereo");
         }
         const float gain = host_volume() * atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);

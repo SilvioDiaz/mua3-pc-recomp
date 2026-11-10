@@ -429,6 +429,19 @@ visibilidade padrão pela lista global em ordem de carga (main primeiro), e só 
 (libc++ duplicada, tabelas do Opus, `operator new`). Na play13 o `new[]` da SDK aponta para `main+0x175ed0`, o heap ficou
 íntegro (10800+ varreduras) e os vídeos `EV_0101_01..03` passaram sem crash.
 
+## Rodada 15 (2026-11-09/10): sem música
+
+- Sintoma: sons do menu tocam, música não. (As execuções play18-23 não chegaram ao menu, por isso pareciam mudas.)
+- `TOTK_TRACE=audio` agora loga a cada 5 s: vozes que tocaram (formato, rota, nível), vozes em uso, os efeitos aux
+  (cabeçalhos CPU/DSP, nível do retorno), mixes e memory pools por estado.
+- play24: a música toca no motor (vozes 0 e 1, stream DSP-ADPCM estéreo 48 kHz, blocos de 2016 amostras, rms ~0,2)
+  na mix 10, que segue pelo splitter 1. Os sons do menu (vozes 2 e 3, 28 kHz) vão pela mix 9 direto à final.
+- Causa: `audio_mixer.c` `mix_depth` só seguia `dest_mix_id`; uma mix roteada por splitter ficava com profundidade 1
+  e era somada no destino depois de ele já ter sido enviado adiante, ou seja, perdida. Agora segue também os
+  destinos do splitter (como o Ryujinx MixContext). Confirmado em play25: a música toca.
+- Também: `audren.c` `update_voice` passou a usar a posição do registro como slot (como o Ryujinx), não o campo id.
+- Os 7 efeitos aux (mixes 3-9) são o reverb da Koei feito na CPU; o anel funciona.
+
 ## Próximos marcos
 
 1. (feito na rodada 4) Reproduzir o vídeo sob demanda e descobrir por que o quadro decodificado não aparece (o jogo usa

@@ -88,9 +88,15 @@ static void voice_reset(ServerVoice *v) {
     memset(v->biquad_state, 0, sizeof v->biquad_state);
 }
 
-static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
-    need(in->id < (uint32_t)r->param.voice_count, "voice id out of range");
-    ServerVoice *v = &r->voices[in->id];
+// The voice section holds one record per voice slot, in slot order; a record's slot is its position, not its id field
+// (Ryujinx StateUpdater.UpdateVoices indexes by position too). Unused records can carry any id: MUA3's REV6 client
+// leaves it 0, so taking the id overwrote voice 0 with every unused record and no voice ever played.
+static void update_voice(AudioRenderer *r, int slot, const AudrenVoiceIn *in) {
+    ServerVoice *v = &r->voices[slot];
+    if (in->in_use && in->id != (uint32_t)slot) {
+        static int reported;
+        if (!reported++) rt_log("audren: voice slot %d carries id %u", slot, in->id);
+    }
     if (in->is_new || !in->in_use) voice_reset(v);
     v->in = *in;
     v->use_float_biquads = 0;
@@ -252,8 +258,8 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
             }
         } else
             memcpy(&v, voices + i * voice_stride, sizeof v);
-        update_voice(r, &v);
-        ServerVoice *server = &r->voices[v.id];
+        update_voice(r, i, &v);
+        ServerVoice *server = &r->voices[i];
         server->use_float_biquads = (uint8_t)float_voices;
         if (float_voices) memcpy(server->float_biquads, v2.biquads, sizeof v2.biquads);
     }
