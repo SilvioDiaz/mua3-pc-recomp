@@ -157,6 +157,22 @@ totk.ini.example, VERSION  the default ini; the release string (the repository's
 - The release contains nothing game-derived; `make_release.py` runs `tools/check_content.py` over the folder before it
   finishes.
 
+## RecompLauncher
+
+`recomplauncher.json` at the top of the release tells [RecompLauncher](https://recomplauncher.com) how to set the game
+up and start it. The launcher unpacks the release zip into its own folder (`{install}`), asks the player for one folder
+holding the base game, the update and `prod.keys`, and runs the setup without a window:
+
+```
+python/python.exe -m installer.recomplauncher --game <that folder> --dest {install}/game
+```
+
+`installer/recomplauncher.py` tells the base game and the update apart by the title id of their Meta NCA (read with the
+keys, so file names do not matter; DLC and other files in the folder are ignored), runs the command line above with
+`CREATE_NO_WINDOW` and turns its events into `progress <0..1> <text>` lines. The game is built into `{install}/game`
+(`mua3.exe`, `mua3.ini`, `profile/`, `logs/`), the temp folder is the release's `temp/`. Play starts
+`game/mua3.exe`; the launcher's settings page edits `game/mua3.ini`.
+
 ## Switch system fonts
 
 Simplified Chinese, Traditional Chinese and Korean text needs the Switch system fonts (`0-standard.bfttf` and the other

@@ -1,5 +1,7 @@
 # MUA3 Recomp
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 A static recompilation of *Marvel Ultimate Alliance 3: The Black Order* (Nintendo Switch) into a native x86-64 Windows
 executable. The game's ARM64 code is turned into C and compiled for PC; this is not an emulator.
 
@@ -115,10 +117,20 @@ Fixes were also brought over from other open recomps: Cadence of Hyrule, Astral 
 Emblem: Three Houses and Pokopia; fefw-recomp, DKB Recomp and hwaoi-recomp were read for how they replay geometry
 shaders (GPL code was only read for behaviour and rewritten, never copied).
 
+## Installing
+
+Windows only, game version **4.0.1** only (base game 1.0.0 + the 4.0.1 update). The release carries no game code: its
+setup builds `mua3.exe` from your own files on your PC (about 40 GB free during setup).
+
+- **With [RecompLauncher](https://recomplauncher.com):** install the recomp and pick the folder that holds your base
+  game, the 4.0.1 update (NSP, XCI, NSZ or XCZ) and your console's `prod.keys`. The launcher builds the game and
+  starts it, and shows its settings on the game's page (`recomplauncher.json`).
+- **By hand:** unpack `MUA3-Setup-<version>-windows-x64.zip`, start `MUA3-Setup.exe`, pick the same three files and an
+  install folder ([docs/installer.md](docs/installer.md)).
+
 ## Building from source
 
-Windows only, game version **4.0.1** only (base game 1.0.0 + the 4.0.1 update). There is no installer yet; releases are
-source snapshots (no executable, since one would contain the game's code).
+Windows only, game version **4.0.1** only.
 
 Requirements: MSYS2 UCRT64 (clang/lld, ninja, SDL3, opus, libvpx, zstd, Vulkan headers), Python 3.12 and 3.14, the
 .NET SDK and Visual Studio Build Tools (for the shader translator), a GPU with Vulkan 1.3 and about 60 GB free.
