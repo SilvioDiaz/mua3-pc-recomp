@@ -719,6 +719,7 @@ static void tab_screen(float scale) {
 
 static void tab_game(float scale) {
     opt_begin("##game", scale);
+    if (rt_game_id == 1) opt_toggle("TOTK_MUA3_FPS60", UI_MENU_MUA3_FPS60, UI_MENU_MUA3_FPS60_DESC);
     row_fps_limit();
     row_game_lang();
     static const UiTextId mode[] = {UI_MENU_MODE_DOCKED, UI_MENU_MODE_HANDHELD};

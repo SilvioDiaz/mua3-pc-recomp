@@ -179,6 +179,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OPERATION_MODE] = "Console mode",
     [UI_MENU_OPERATION_MODE_DESC] = "Whether the game thinks it runs docked or handheld.",
     [UI_MENU_MODE_DOCKED] = "Docked", [UI_MENU_MODE_HANDHELD] = "Handheld",
+    [UI_MENU_MUA3_FPS60] = "60 FPS",
+    [UI_MENU_MUA3_FPS60_DESC] = "On (the default), the game runs at 60 frames per second instead of its shipping 30, through the community 60 FPS cheat for version 4.0.1 (build E853C44FDF18B88F). Takes effect after a restart.",
     [UI_MENU_ASSUME_FOCUS] = "Keep running out of focus",
     [UI_MENU_ASSUME_FOCUS_DESC] = "On (the default), the game keeps running while you are in another window, and the "
                                   "keyboard stays quiet until the window is in front again. Off, it pauses when its "
@@ -1028,6 +1030,8 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                "precisa de Velocidade do jogo pelo relógio.",
     [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_40] = "40 FPS", [UI_MENU_FPS_45] = "45 FPS",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
+    [UI_MENU_MUA3_FPS60] = "60 FPS",
+    [UI_MENU_MUA3_FPS60_DESC] = "Ligado (o padrão), o jogo roda a 60 quadros por segundo em vez dos 30 originais, com o cheat de 60 FPS da comunidade para a versão 4.0.1 (build E853C44FDF18B88F). Vale depois de reiniciar.",
     [UI_MENU_ASSUME_FOCUS] = "Continuar rodando fora de foco",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Ligado (o padrão), o jogo continua rodando enquanto você está em outra janela, e o "
                                   "teclado fica sem efeito até a janela voltar para a frente. Desligado, ele pausa quando "

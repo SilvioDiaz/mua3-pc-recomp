@@ -1,0 +1,9 @@
+# Code patches for Marvel Ultimate Alliance 3 4.0.1 main (build E853C44FDF18B88F, recomp/patches.py).
+
+set mua3fps60 TOTK_MUA3_FPS60 1
+
+# 60 fps. The frame setup (main+0x839000) takes the present interval from main+0x45A7410 (1 with the 60 FPS cheat the
+# runtime runs, cheats.c), stores it in the frame settings (+0x1E566C) and calls main+0x442fd0, whose mode 0 raises it
+# to at least 2: 30 fps whatever the cheat wrote. Here that floor is 1.
+site mua3fps60 main 442fec 321f03ea 5280002a   # mov w10, #2 -> mov w10, #1
+site mua3fps60 main 442ff4 7100093f 7100053f   # cmp w9, #2 -> cmp w9, #1 (interval = max(interval, 1))

@@ -36,7 +36,7 @@ TotK recomp como base. Uso pessoal, a partir de um dump do próprio console.
 
 ```
 .venv-py314\Scripts\python -I tools\mua3_extract.py --base build\unpacked\base.nsp --update build\unpacked\update.nsp --keys "D:\Games\Marvel Ultimate Alliance 3\prod.keys"
-.venv\Scripts\python recomp\gen.py --exefs build\extracted\upd\exefs --out generated\upd --modules main,subsdk0,subsdk1,sdk
+.venv\Scripts\python recomp\gen.py --exefs build\extracted\upd\exefs --out generated\upd --modules main,subsdk0,subsdk1,sdk --patches recomp\patches-mua3-v401.txt
 .venv\Scripts\python tools\build_game.py --game mua3 --version upd --gen generated\upd --out build\upd --exefs build\extracted\upd\exefs --romfs build\extracted\upd\romfs --expected build\extracted\expected-upd.json
 build\upd\totk.exe --selftest
 ```

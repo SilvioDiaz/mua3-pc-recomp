@@ -55,6 +55,21 @@ static char g_dir[PLAT_PATH_MAX];   // the folder of totk.exe, with a trailing s
 static int g_files;            // mods whose file was read
 static uint64_t g_main, g_main_size, g_code_end;   // main's image; its code with the padding up to .rodata
 
+// MUA3 4.0.1's 60 FPS cheat ("60fps MV ( 4.0.1 )", build E853C44FDF18B88F), built in: TOTK_MUA3_FPS60 (the Game tab, on
+// by default, read at start). All its writes land in main's .bss, so the VM runs it like a mod's data cheat: the frame
+// rate 60.0f, the present interval 1 and the game's step settings. The same setting switches the patch set mua3fps60
+// (recomp/patches-mua3-v401.txt), which lets the frame setup keep that interval: without it the game raises it to 2.
+static const uint32_t FPS60_WORDS[] = {
+    0x04000000, 0x045A71F0, 0x42700000,
+    0x04000000, 0x045A7410, 0x00000001,
+    0x04000000, 0x045A7414, 0x00000001,
+    0x580F0000, 0x03D4E5B0,
+    0x580F1000, 0x00000090,
+    0x780F0000, 0x00000F14,
+    0x640F0000, 0x00000000, 0x00000001,
+};
+static Cheat g_fps60;          // words set: on
+
 static uint32_t fnv(const char *s, size_t n) {
     uint32_t h = 0x811C9DC5u;
     for (size_t i = 0; i < n; i++) h = (h ^ (uint8_t)s[i]) * 0x01000193u;
@@ -517,6 +532,15 @@ void cheats_init(void) {
     g_main_size = m->size;
     g_code_end = m->base + ((m->text_end + 0xFFF) & ~0xFFFull);
     snprintf(g_file, sizeof g_file, "%s.txt", bid);
+    if (RT_MUA3 && !strcmp(bid, "E853C44FDF18B88F")) {
+        if (cfg_bool("TOTK_MUA3_FPS60")) {
+            g_fps60.words = (uint32_t *)FPS60_WORDS;
+            g_fps60.n = (int)(sizeof FPS60_WORDS / sizeof *FPS60_WORDS);
+        }
+        rt_log("cheats: built-in 60 FPS %s (TOTK_MUA3_FPS60)", g_fps60.n ? "on" : "off");
+    } else if (RT_MUA3) {
+        rt_log("cheats: built-in 60 FPS needs build E853C44FDF18B88F (4.0.1), this is %s", bid);
+    }
     mods_scan();
     for (int k = 0; k < mods_count(); k++) {   // the Mods tab's order, top first
         const ModInfo *mod = mods_at(k);
@@ -629,7 +653,9 @@ void cheats_set(int i, int on) {
 }
 
 void cheats_frame(uint64_t frame) {
-    if (!g_vm || frame < 60) return;   // the game polls its input (and starts SDL) before this
+    if (frame < 60) return;   // the game polls its input (and starts SDL) before this
+    if (g_fps60.n) run(&g_fps60, 0);
+    if (!g_vm) return;
     uint64_t keys = 0;
     int32_t lx, ly, rx, ry;
     input_poll(&keys, &lx, &ly, &rx, &ry);   // 0 while the menu is open
